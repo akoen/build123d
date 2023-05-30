@@ -124,7 +124,11 @@ from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
 from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
 from OCP.BRepLib import BRepLib, BRepLib_FindSurface
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
-from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
+from OCP.BRepOffset import (
+    BRepOffset_MakeOffset,
+    BRepOffset_Skin,
+    BRepOffset_MakeSimpleOffset,
+)
 from OCP.BRepOffsetAPI import (
     BRepOffsetAPI_MakeFilling,
     BRepOffsetAPI_MakeOffset,
@@ -1167,6 +1171,68 @@ class Mixin3D:
             shape = feat.Shape()
 
         return self.__class__(shape)
+
+
+class MixinSurface:
+    def offset(
+        self,
+        depth: float,
+        thicken: bool,
+        simple: bool = False,
+    ) -> Union[Shell, Solid]:
+        """Offset Surface, optionally thickening to create a solid.
+
+        .. image:: thickenFace.png
+
+        Args:
+            depth (float): Amount to thicken surface
+            thicken (bool): Whether to thicken to create Solid, otherwise offset
+            simple (bool, optional): Simple offsetting. Defaults to False.
+
+        Raises:
+            RuntimeError: OpenCASCADE internal failures
+
+        Returns:
+            Union[Shell, Solid]: The resulting Shell or Solid
+        """
+
+        if simple:
+            builder = BRepOffset_MakeSimpleOffset()
+            builder.Initialize(self.wrapped, depth)
+
+            if thicken:
+                builder.SetBuildSolidFlag(True)
+
+            builder.Perform()
+            result = builder.GetResultShape()
+        else:
+            builder = BRepOffset_MakeOffset()
+            builder.Initialize(
+                self.wrapped,
+                Offset=depth,
+                Tol=1.0e-5,
+                Mode=BRepOffset_Skin,
+                Intersection=True,
+                SelfInter=False,
+                Join=GeomAbs_Intersection,  # GeomAbs_Arc sometimes preferable
+                Thickening=thicken,
+                RemoveIntEdges=True,
+            )
+
+            builder.MakeOffsetShape()
+            try:
+                result = builder.Shape()
+            except StdFail_NotDone as err:
+                raise RuntimeError("Internal error applying offset") from err
+
+        if thicken:
+            return Solid(result.clean())
+        else:
+            return Shell(result.clean())
+
+    def thicken(self, depth: float, simple: bool = False) -> Solid:
+        """Applies offset with thicken = True"""
+        return self.offset(depth, True, simple)
 
 
 class Shape(NodeMixin):
@@ -4197,7 +4263,7 @@ class Edge(Shape, Mixin1D):
         return Axis(self.position_at(0), self.position_at(1) - self.position_at(0))
 
 
-class Face(Shape):
+class Face(Shape, MixinSurface):
     """a bounded surface that represents part of the boundary of a solid"""
 
     _dim = 2
@@ -4728,58 +4794,6 @@ class Face(Shape):
             ]
         )
 
-    def thicken(self, depth: float, normal_override: VectorLike = None) -> Solid:
-        """Thicken Face
-
-        Create a solid from a potentially non planar face by thickening along the normals.
-
-        .. image:: thickenFace.png
-
-        Non-planar faces are thickened both towards and away from the center of the sphere.
-
-        Args:
-            depth (float): Amount to thicken face(s), can be positive or negative.
-            normal_override (Vector, optional): The normal_override vector can be used to
-                indicate which way is 'up', potentially flipping the face normal direction
-                such that many faces with different normals all go in the same direction
-                (direction need only be +/- 90 degrees from the face normal). Defaults to None.
-
-        Raises:
-            RuntimeError: Opencascade internal failures
-
-        Returns:
-            Solid: The resulting Solid object
-        """
-        # Check to see if the normal needs to be flipped
-        adjusted_depth = depth
-        if normal_override is not None:
-            face_center = self.center()
-            face_normal = self.normal_at(face_center).normalized()
-            if face_normal.dot(Vector(normal_override).normalized()) < 0:
-                adjusted_depth = -depth
-
-        solid = BRepOffset_MakeOffset()
-        solid.Initialize(
-            self.wrapped,
-            Offset=adjusted_depth,
-            Tol=1.0e-5,
-            Mode=BRepOffset_Skin,
-            # BRepOffset_RectoVerso - which describes the offset of a given surface shell along both
-            # sides of the surface but doesn't seem to work
-            Intersection=True,
-            SelfInter=False,
-            Join=GeomAbs_Intersection,  # Could be GeomAbs_Arc,GeomAbs_Tangent,GeomAbs_Intersection
-            Thickening=True,
-            RemoveIntEdges=True,
-        )
-        solid.MakeOffsetShape()
-        try:
-            result = Solid(solid.Shape())
-        except StdFail_NotDone as err:
-            raise RuntimeError("Error applying thicken to given Face") from err
-
-        return result.clean()
-
     def project_to_shape(
         self, target_object: Shape, direction: VectorLike, taper: float = 0
     ) -> ShapeList[Face]:
@@ -4879,7 +4893,7 @@ class Face(Shape):
         return Compound.make_compound([self]).is_inside(point, tolerance)
 
 
-class Shell(Shape):
+class Shell(Shape, MixinSurface):
     """the outer boundary of a surface"""
 
     _dim = 2

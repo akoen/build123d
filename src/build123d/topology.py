@@ -54,6 +54,7 @@ from typing import (
     Iterator,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
     Type,
     TypeVar,
@@ -4895,6 +4896,32 @@ class Shell(Shape):
         shape = shell_builder.SewedShape()
 
         return cls(shape)
+
+    @classmethod
+    def make_polyhedron(
+        cls, vertices: Sequence[VectorLike], faces: Sequence[Sequence]
+    ) -> Shell:
+        """Generate a polyhedron from vertices and faces
+
+        Args:
+            vertices (Sequence[VectorLike]): Vertex list
+            faces (Sequence[Sequence]): List of faces, where the elements of each face
+            are vertex indices
+
+        Returns:
+            Shell: Polyhedron shell
+        """
+        return cls.make_shell(
+            Face.make_from_wires(
+                Wire.make_wire(
+                    Edge.make_line(
+                        tuple(vertices[face[i - 1]]), tuple(vertices[face[i]])
+                    )
+                    for i in range(len(face))
+                )
+            )
+            for face in faces
+        )
 
     def center(self) -> Vector:
         """Center of mass of the shell"""

@@ -69,6 +69,8 @@ from OCP.Quantity import Quantity_ColorRGBA
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS_Face, TopoDS_Shape
 
+import numpy as np
+
 # Create a build123d logger to distinguish these logs from application logs.
 # If the user doesn't configure logging, all build123d logs will be discarded.
 logging.getLogger("build123d").addHandler(logging.NullHandler())
@@ -139,6 +141,16 @@ class Vector:
                     f_v = gp_Vec(*arg)
                 elif len(arg) == 2:
                     f_v = gp_Vec(*arg, 0)
+            elif isinstance(args[0], np.ndarray):
+                arg = args[0]
+                if not arg.ndim == 1:
+                    raise TypeError("ndarray must be of dimension 1")
+                if arg.size == 3:
+                    f_v = gp_Vec(*arg)
+                elif arg.size == 2:
+                    f_v = gp_Vec(*arg, 0)
+                else:
+                    raise TypeError("ndarray must be of size 2 or 3")
             elif isinstance(args[0], (gp_Vec, gp_Pnt, gp_Dir)):
                 f_v = gp_Vec(args[0].XYZ())
             elif isinstance(args[0], gp_XYZ):

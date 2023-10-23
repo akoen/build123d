@@ -161,6 +161,7 @@ from OCP.GCE2d import GCE2d_MakeSegment
 from OCP.GCPnts import GCPnts_AbscissaPoint, GCPnts_QuasiUniformDeflection
 from OCP.Geom import (
     Geom_BezierCurve,
+    Geom_BezierSurface,
     Geom_ConicalSurface,
     Geom_CylindricalSurface,
     Geom_Plane,
@@ -1390,7 +1391,7 @@ class MixinSurface:
     def offset(
         self,
         depth: float,
-        thicken: bool,
+        thicken: bool = False,
         simple: bool = False,
     ) -> Union[Shell, Solid]:
         """Offset Surface, optionally thickening to create a solid.
@@ -1417,6 +1418,10 @@ class MixinSurface:
                 builder.SetBuildSolidFlag(True)
 
             builder.Perform()
+            if not builder.IsDone():
+                raise RuntimeError(
+                    "Internal error applying offset. Likely failure in BRepOffset_MakeSimpleOffset::BuildMissingWalls()"
+                )
             result = builder.GetResultShape()
         else:
             builder = BRepOffset_MakeOffset()
@@ -1427,21 +1432,24 @@ class MixinSurface:
                 Mode=BRepOffset_Skin,
                 Intersection=True,
                 SelfInter=False,
-                Join=GeomAbs_Intersection,  # GeomAbs_Arc sometimes preferable
+                # Join=GeomAbs_Intersection,  # GeomAbs_Arc sometimes preferable
+                Join=GeomAbs_JoinType.GeomAbs_Arc,
                 Thickening=thicken,
                 RemoveIntEdges=True,
             )
 
             builder.MakeOffsetShape()
+            if not builder.IsDone():
+                raise RuntimeError("Internal error applying offset")
             try:
                 result = builder.Shape()
             except StdFail_NotDone as err:
                 raise RuntimeError("Internal error applying offset") from err
 
         if thicken:
-            return Solid(result.clean())
+            return Solid(result).clean()
         else:
-            return Shell(result.clean())
+            return Shell(result).clean()
 
     def thicken(self, depth: float, simple: bool = False) -> Solid:
         """Applies offset with thicken = True"""
@@ -5076,9 +5084,9 @@ class Face(Shape, MixinSurface):
         new_face.wrapped = downcast(self.wrapped.Complemented())
         return new_face
 
-    def offset(self, amount: float) -> Face:
-        """Return a copy of self moved along the normal by amount"""
-        return copy.deepcopy(self).moved(Location(self.normal_at() * amount))
+    # def offset(self, amount: float) -> Face:
+    #     """Return a copy of self moved along the normal by amount"""
+    #     return copy.deepcopy(self).moved(Location(self.normal_at() * amount))
 
     def normal_at(self, surface_point: VectorLike = None) -> Vector:
         """normal_at
@@ -5402,6 +5410,22 @@ class Face(Shape, MixinSurface):
         spline_geom = spline_builder.Surface()
 
         return cls(BRepBuilderAPI_MakeFace(spline_geom, Precision.Confusion_s()).Face())
+
+    @classmethod
+    def make_surface_from_array_of_points_bezier(
+        cls,
+        points: list[list[VectorLike]],
+    ) -> Face:
+        points_ = TColgp_HArray2OfPnt(1, len(points), 1, len(points[0]))
+
+        for i, point_row in enumerate(points):
+            for j, point in enumerate(point_row):
+                points_.SetValue(i + 1, j + 1, Vector(point).to_pnt())
+
+        surf1 = Geom_BezierSurface(points_)
+        aFace = BRepBuilderAPI_MakeFace(surf1, 1e-6).Face()
+
+        return cls(aFace)
 
     @classmethod
     def make_surface(
@@ -5774,6 +5798,8 @@ class Solid(Shape, Mixin3D):
         """A box of the same dimensions and location"""
         return Solid.make_box(*bbox.size).locate(Location(bbox.min))
 
+    
+    @overload
     @classmethod
     def make_box(
         cls, length: float, width: float, height: float, plane: Plane = Plane.XY
@@ -5791,14 +5817,40 @@ class Solid(Shape, Mixin3D):
         Returns:
             Solid: Box
         """
-        return cls(
-            BRepPrimAPI_MakeBox(
-                plane.to_gp_ax2(),
-                length,
-                width,
-                height,
-            ).Shape()
-        )
+        ...
+
+
+    @overload
+    @classmethod
+    def make_box(cls, corner1: VectorLike, corner2: VectorLike):
+        """Make box from two corner points"""
+        ...
+
+    @classmethod
+    def make_box(cls, *args, **kwargs):
+        if len(args) == 3 and all(isinstance(v, (int, float)) for v in args):
+            plane = kwargs["plane"] if "plane" in kwargs else Plane.XY
+            return cls(
+                BRepPrimAPI_MakeBox(
+                    plane.to_gp_ax2(),
+                    args[0],
+                    args[1],
+                    args[2],
+                ).Shape()
+            )
+
+        elif len(args) == 2:
+            return cls(
+                BRepPrimAPI_MakeBox(
+                    Vector(args[0]).to_pnt(),
+                    Vector(args[1]).to_pnt()
+                ).Shape()
+            )
+        
+        else:
+            raise ValueError("Invalid Box - Expected length, width, height or corner points")
+        
+
 
     @classmethod
     def make_cone(

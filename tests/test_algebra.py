@@ -699,8 +699,17 @@ class OperationsTests(unittest.TestCase):
     def test_extrude_both(self):
         s = Circle(1)
         p = extrude(s, amount=1, both=True)
-        p = chamfer(p.edges().filter_by(GeomType.CIRCLE), 0.3)
-        self.assertEqual(len(p.edges().filter_by(GeomType.CIRCLE)), 5)
+        self.assertAlmostEqual(p.bounding_box().size.Z, 2, 4)
+
+
+class RightMultipleTests(unittest.TestCase):
+    def test_rmul(self):
+        c = [Location((1, 2, 3))] * Circle(1)
+        self.assertTupleAlmostEquals(c[0].position, (1, 2, 3), 6)
+
+    def test_rmul_error(self):
+        with self.assertRaises(ValueError):
+            [Vector(1, 2, 3)] * Circle(1)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 import copy
 import math
 import os
+import platform
 import random
 import re
 from typing import Optional
@@ -27,17 +28,25 @@ from OCP.gp import (
 from build123d.build_common import GridLocations, Locations, PolarLocations
 from build123d.build_enums import (
     Align,
+    AngularDirection,
     CenterOf,
     GeomType,
+    Keep,
     Kind,
+    Mode,
     PositionMode,
+    Side,
     SortBy,
     Until,
 )
 from build123d.build_part import BuildPart
 from build123d.operations_part import extrude
-from build123d.objects_part import Box
+from build123d.operations_sketch import make_face
+from build123d.operations_generic import fillet, add
+from build123d.objects_part import Box, Cylinder
+from build123d.objects_curve import Polyline
 from build123d.build_sketch import BuildSketch
+from build123d.build_line import BuildLine
 from build123d.objects_sketch import Circle, Rectangle, RegularPolygon
 from build123d.geometry import (
     Axis,
@@ -45,21 +54,18 @@ from build123d.geometry import (
     Color,
     Location,
     Matrix,
+    Pos,
     Rotation,
     Vector,
     VectorLike,
 )
-from build123d.importers import import_brep, import_step, import_stl, import_svg
+from build123d.importers import import_brep, import_step, import_stl
+from build123d.mesher import Mesher
 from build123d.topology import (
-    BallJoint,
     Compound,
-    CylindricalJoint,
     Edge,
     Face,
-    LinearJoint,
     Plane,
-    RevoluteJoint,
-    RigidJoint,
     Shape,
     ShapeList,
     Shell,
@@ -68,7 +74,10 @@ from build123d.topology import (
     Wire,
     edges_to_wires,
     polar,
+    new_edges,
+    delta,
 )
+from build123d.jupyter_tools import display
 
 DEG2RAD = math.pi / 180
 RAD2DEG = 180 / math.pi
@@ -188,6 +197,30 @@ class TestAssembly(unittest.TestCase):
 class TestAxis(DirectApiTestCase):
     """Test the Axis class"""
 
+    def test_axis_init(self):
+        test_axis = Axis((1, 2, 3), (0, 0, 1))
+        self.assertVectorAlmostEquals(test_axis.position, (1, 2, 3), 5)
+        self.assertVectorAlmostEquals(test_axis.direction, (0, 0, 1), 5)
+
+        test_axis = Axis((1, 2, 3), direction=(0, 0, 1))
+        self.assertVectorAlmostEquals(test_axis.position, (1, 2, 3), 5)
+        self.assertVectorAlmostEquals(test_axis.direction, (0, 0, 1), 5)
+
+        test_axis = Axis(origin=(1, 2, 3), direction=(0, 0, 1))
+        self.assertVectorAlmostEquals(test_axis.position, (1, 2, 3), 5)
+        self.assertVectorAlmostEquals(test_axis.direction, (0, 0, 1), 5)
+
+        test_axis = Axis(Edge.make_line((1, 2, 3), (1, 2, 4)))
+        self.assertVectorAlmostEquals(test_axis.position, (1, 2, 3), 5)
+        self.assertVectorAlmostEquals(test_axis.direction, (0, 0, 1), 5)
+
+        test_axis = Axis(edge=Edge.make_line((1, 2, 3), (1, 2, 4)))
+        self.assertVectorAlmostEquals(test_axis.position, (1, 2, 3), 5)
+        self.assertVectorAlmostEquals(test_axis.direction, (0, 0, 1), 5)
+
+        with self.assertRaises(ValueError):
+            Axis("one", "up")
+
     def test_axis_from_occt(self):
         occt_axis = gp_Ax1(gp_Pnt(1, 1, 1), gp_Dir(0, 1, 0))
         test_axis = Axis.from_occt(occt_axis)
@@ -208,7 +241,7 @@ class TestAxis(DirectApiTestCase):
 
     def test_axis_to_location(self):
         # TODO: Verify this is correct
-        x_location = Axis.X.to_location()
+        x_location = Axis.X.location
         self.assertTrue(isinstance(x_location, Location))
         self.assertVectorAlmostEquals(x_location.position, (0, 0, 0), 5)
         self.assertVectorAlmostEquals(x_location.orientation, (0, 90, 180), 5)
@@ -253,6 +286,40 @@ class TestAxis(DirectApiTestCase):
     def test_axis_reverse_op(self):
         axis = -Axis.X
         self.assertVectorAlmostEquals(axis.direction, (-1, 0, 0), 5)
+
+    def test_axis_as_edge(self):
+        edge = Axis.X.as_infinite_edge()
+        self.assertTrue(isinstance(edge, Edge))
+        common = (edge & Edge.make_line((0, 0, 0), (1, 0, 0))).edge()
+        self.assertAlmostEqual(common.length, 1, 5)
+
+    def test_axis_intersect(self):
+        common = (Axis.X.intersect(Edge.make_line((0, 0, 0), (1, 0, 0)))).edge()
+        self.assertAlmostEqual(common.length, 1, 5)
+
+        common = (Axis.X & Edge.make_line((0, 0, 0), (1, 0, 0))).edge()
+        self.assertAlmostEqual(common.length, 1, 5)
+
+        intersections = (Axis.X & Axis.Y).vertices()
+        self.assertEqual(len(intersections), 1)
+        self.assertVectorAlmostEquals(intersections[0], (0, 0, 0), 5)
+
+        intersection = Axis((1, 2, 3), (0, 0, 1)) & Plane.XY
+        self.assertTupleAlmostEquals(intersection.to_tuple(), (1, 2, 0), 5)
+
+        # TODO: uncomment when generalized edge to surface intersections are complete
+        # non_planar = (
+        #     Solid.make_cylinder(1, 10).faces().filter_by(GeomType.PLANE, reverse=True)
+        # )
+        # intersections = Axis((0, 0, 5), (1, 0, 0)) & non_planar
+
+        # self.assertTrue(len(intersections.vertices(), 2))
+        # self.assertTupleAlmostEquals(
+        #     intersection.vertices()[0].to_tuple(), (-1, 0, 5), 5
+        # )
+        # self.assertTupleAlmostEquals(
+        #     intersection.vertices()[1].to_tuple(), (1, 0, 5), 5
+        # )
 
 
 class TestBoundBox(DirectApiTestCase):
@@ -315,6 +382,12 @@ class TestBoundBox(DirectApiTestCase):
 
     def test_combined_center_of_boundbox(self):
         pass
+
+    def test_clean_boundbox(self):
+        s = Solid.make_sphere(3)
+        self.assertVectorAlmostEquals(s.bounding_box().size, (6, 6, 6), 5)
+        s.mesh(1e-3)
+        self.assertVectorAlmostEquals(s.bounding_box().size, (6, 6, 6), 5)
 
     # def test_to_solid(self):
     #     bbox = Solid.make_sphere(1).bounding_box()
@@ -561,7 +634,7 @@ class TestColor(unittest.TestCase):
         self.assertEqual(c.wrapped.GetRGB().Red(), 0.0)
         self.assertEqual(c.wrapped.GetRGB().Green(), 0.0)
         self.assertEqual(c.wrapped.GetRGB().Blue(), 1.0)
-        self.assertEqual(c.wrapped.Alpha(), 0.0)
+        self.assertEqual(c.wrapped.Alpha(), 1.0)
 
     def test_name2(self):
         c = Color("blue", alpha=0.5)
@@ -667,6 +740,18 @@ class TestCompound(DirectApiTestCase):
         with self.assertRaises(ValueError):
             test_compound.center(CenterOf.GEOMETRY)
 
+    def test_triad(self):
+        triad = Compound.make_triad(10)
+        bbox = triad.bounding_box()
+        self.assertGreater(bbox.min.X, -10 / 8)
+        self.assertLess(bbox.min.X, 0)
+        self.assertGreater(bbox.min.Y, -10 / 8)
+        self.assertLess(bbox.min.Y, 0)
+        self.assertGreater(bbox.min.Y, -10 / 8)
+        self.assertAlmostEqual(bbox.min.Z, 0, 4)
+        self.assertLess(bbox.size.Z, 12.5)
+        self.assertEqual(triad.volume, 0)
+
 
 class TestEdge(DirectApiTestCase):
     def test_close(self):
@@ -674,6 +759,36 @@ class TestEdge(DirectApiTestCase):
             Edge.make_circle(1, end_angle=180).close().length, math.pi + 2, 5
         )
         self.assertAlmostEqual(Edge.make_circle(1).close().length, 2 * math.pi, 5)
+
+    def test_make_half_circle(self):
+        half_circle = Edge.make_circle(radius=1, start_angle=0, end_angle=180)
+        self.assertVectorAlmostEquals(half_circle.start_point(), (1, 0, 0), 3)
+        self.assertVectorAlmostEquals(half_circle.end_point(), (-1, 0, 0), 3)
+
+    def test_make_half_circle2(self):
+        half_circle = Edge.make_circle(radius=1, start_angle=270, end_angle=90)
+        self.assertVectorAlmostEquals(half_circle.start_point(), (0, -1, 0), 3)
+        self.assertVectorAlmostEquals(half_circle.end_point(), (0, 1, 0), 3)
+
+    def test_make_clockwise_half_circle(self):
+        half_circle = Edge.make_circle(
+            radius=1,
+            start_angle=180,
+            end_angle=0,
+            angular_direction=AngularDirection.CLOCKWISE,
+        )
+        self.assertVectorAlmostEquals(half_circle.end_point(), (1, 0, 0), 3)
+        self.assertVectorAlmostEquals(half_circle.start_point(), (-1, 0, 0), 3)
+
+    def test_make_clockwise_half_circle2(self):
+        half_circle = Edge.make_circle(
+            radius=1,
+            start_angle=90,
+            end_angle=-90,
+            angular_direction=AngularDirection.CLOCKWISE,
+        )
+        self.assertVectorAlmostEquals(half_circle.start_point(), (0, 1, 0), 3)
+        self.assertVectorAlmostEquals(half_circle.end_point(), (0, -1, 0), 3)
 
     def test_arc_center(self):
         self.assertVectorAlmostEquals(Edge.make_ellipse(2, 1).arc_center, (0, 0, 0), 5)
@@ -714,17 +829,6 @@ class TestEdge(DirectApiTestCase):
             self.assertVectorAlmostEquals(locs[i].position, (x, 0, 0), 5)
         self.assertVectorAlmostEquals(locs[0].orientation, (0, 0, 0), 5)
 
-    # def test_overlaps(self):
-    #     self.assertTrue(
-    #         Edge.make_circle(10, end_angle=60).overlaps(
-    #             Edge.make_circle(10, start_angle=30, end_angle=90)
-    #         )
-    #     )
-    #     tolerance = 1e-4
-    #     self.assertFalse(
-    #         Edge.make_line((-10,0),(0,0)).overlaps(Edge.make_line((1.1*tolerance,0),(10,0)), tolerance)
-    #     )
-
     def test_to_wire(self):
         edge = Edge.make_line((0, 0, 0), (1, 1, 1))
         for end in [0, 1]:
@@ -747,21 +851,27 @@ class TestEdge(DirectApiTestCase):
     def test_intersections(self):
         circle = Edge.make_circle(1)
         line = Edge.make_line((0, -2), (0, 2))
-        crosses = circle.intersections(Plane.XY, line)
+        crosses = circle.intersections(line)
         for target, actual in zip([(0, 1, 0), (0, -1, 0)], crosses):
             self.assertVectorAlmostEquals(actual, target, 5)
 
         with self.assertRaises(ValueError):
-            circle.intersections(Plane.XY, Edge.make_line((0, 0, -1), (0, 0, 1)))
+            circle.intersections(Edge.make_line((0, 0, -1), (0, 0, 1)))
         with self.assertRaises(ValueError):
-            circle.intersections(Plane.XZ, Edge.make_line((0, 0, -1), (0, 0, 1)))
+            circle.intersections(Edge.make_line((0, 0, -1), (0, 0, 1)))
 
         self_intersect = Edge.make_spline([(-3, 2), (3, -2), (4, 0), (3, 2), (-3, -2)])
         self.assertVectorAlmostEquals(
-            self_intersect.intersections(Plane.XY)[0],
+            self_intersect.intersections()[0],
             (-2.6861636507066047, 0, 0),
             5,
         )
+        line = Edge.make_line((1, -2), (1, 2))
+        crosses = line.intersections(Axis.X)
+        self.assertVectorAlmostEquals(crosses[0], (1, 0, 0), 5)
+
+        with self.assertRaises(ValueError):
+            line.intersections(Plane.YZ)
 
     def test_trim(self):
         line = Edge.make_line((-2, 0), (2, 0))
@@ -808,6 +918,34 @@ class TestEdge(DirectApiTestCase):
             )
             self.assertVectorAlmostEquals(loc.orientation, (0, 0, 0), 5)
 
+    def test_find_tangent(self):
+        circle = Edge.make_circle(1)
+        parm = circle.find_tangent(135)[0]
+        self.assertVectorAlmostEquals(
+            circle @ parm, (math.sqrt(2) / 2, math.sqrt(2) / 2, 0), 5
+        )
+        line = Edge.make_line((0, 0), (1, 1))
+        parm = line.find_tangent(45)[0]
+        self.assertAlmostEqual(parm, 0, 5)
+        parm = line.find_tangent(0)
+        self.assertEqual(len(parm), 0)
+
+    def test_param_at_point(self):
+        u = Edge.make_circle(1).param_at_point((0, 1))
+        self.assertAlmostEqual(u, 0.25, 5)
+
+        u = 0.3
+        edge = Edge.make_line((0, 0), (34, 56))
+        pnt = edge.position_at(u)
+        self.assertAlmostEqual(edge.param_at_point(pnt), u, 5)
+
+        with self.assertRaises(ValueError):
+            edge.param_at_point((-1, 1))
+
+    def test_conical_helix(self):
+        helix = Edge.make_helix(1, 4, 1, normal=(-1, 0, 0), angle=10, lefthand=True)
+        self.assertAlmostEqual(helix.bounding_box().min.X, -4, 5)
+
 
 class TestFace(DirectApiTestCase):
     def test_make_surface_from_curves(self):
@@ -838,6 +976,37 @@ class TestFace(DirectApiTestCase):
             (0.5, 0.5, 0),
             5,
         )
+
+    def test_chamfer_2d(self):
+        test_face = Face.make_rect(10,10)
+        test_face = test_face.chamfer_2d(distance=1,distance2=2, vertices=test_face.vertices())
+        self.assertAlmostEqual(test_face.area, 100 - 4 * 0.5 * 1 * 2)
+
+    def test_chamfer_2d_reference(self):
+        test_face = Face.make_rect(10,10)
+        edge = test_face.edges().sort_by(Axis.Y)[0]
+        vertex = edge.vertices().sort_by(Axis.X)[0]
+        test_face = test_face.chamfer_2d(distance=1,distance2=2, vertices=[vertex], edge=edge)
+        self.assertAlmostEqual(test_face.area, 100 - 0.5 * 1 * 2)
+        self.assertAlmostEqual(test_face.edges().sort_by(Axis.Y)[0].length, 9)
+        self.assertAlmostEqual(test_face.edges().sort_by(Axis.X)[0].length, 8)
+
+    def test_chamfer_2d_reference_inverted(self):
+        test_face = Face.make_rect(10,10)
+        edge = test_face.edges().sort_by(Axis.Y)[0]
+        vertex = edge.vertices().sort_by(Axis.X)[0]
+        test_face = test_face.chamfer_2d(distance=2,distance2=1, vertices=[vertex], edge=edge)
+        self.assertAlmostEqual(test_face.area, 100 - 0.5 * 1 * 2)
+        self.assertAlmostEqual(test_face.edges().sort_by(Axis.Y)[0].length, 8)
+        self.assertAlmostEqual(test_face.edges().sort_by(Axis.X)[0].length, 9)
+
+    def test_chamfer_2d_error_checking(self):
+        with self.assertRaises(ValueError):
+            test_face = Face.make_rect(10,10)
+            edge = test_face.edges().sort_by(Axis.Y)[0]
+            vertex = edge.vertices().sort_by(Axis.X)[0]
+            other_edge = test_face.edges().sort_by(Axis.Y)[-1]
+            test_face = test_face.chamfer_2d(distance=1,distance2=2, vertices=[vertex], edge=other_edge)
 
     def test_make_rect(self):
         test_face = Face.make_plane()
@@ -971,6 +1140,9 @@ class TestFace(DirectApiTestCase):
 
     def test_import_stl(self):
         torus = Solid.make_torus(10, 1)
+        # exporter = Mesher()
+        # exporter.add_shape(torus)
+        # exporter.write("test_torus.stl")
         torus.export_stl("test_torus.stl")
         imported_torus = import_stl("test_torus.stl")
         # The torus from stl is tessellated therefore the areas will only be close
@@ -983,6 +1155,96 @@ class TestFace(DirectApiTestCase):
         self.assertFalse(square.is_coplanar(Plane.XY))
         surface: Face = Solid.make_sphere(1).faces()[0]
         self.assertFalse(surface.is_coplanar(Plane.XY))
+
+    def test_center_location(self):
+        square = Face.make_rect(1, 1, plane=Plane.XZ)
+        cl = square.center_location
+        self.assertVectorAlmostEquals(cl.position, (0, 0, 0), 5)
+        self.assertVectorAlmostEquals(cl.orientation, Plane.XZ.location.orientation, 5)
+
+    def test_position_at(self):
+        square = Face.make_rect(2, 2, plane=Plane.XZ.offset(1))
+        p = square.position_at(0.25, 0.75)
+        self.assertVectorAlmostEquals(p, (-0.5, -1.0, 0.5), 5)
+
+    def test_make_surface(self):
+        corners = [Vector(x, y) for x in [-50.5, 50.5] for y in [-24.5, 24.5]]
+        net_exterior = Wire.make_wire(
+            [
+                Edge.make_line(corners[3], corners[1]),
+                Edge.make_line(corners[1], corners[0]),
+                Edge.make_line(corners[0], corners[2]),
+                Edge.make_three_point_arc(
+                    corners[2],
+                    (corners[2] + corners[3]) / 2 - Vector(0, 0, 3),
+                    corners[3],
+                ),
+            ]
+        )
+        surface = Face.make_surface(
+            net_exterior,
+            surface_points=[Vector(0, 0, -5)],
+        )
+        hole_flat = Wire.make_circle(10)
+        hole = hole_flat.project_to_shape(surface, (0, 0, -1))[0]
+        surface = Face.make_surface(
+            exterior=net_exterior,
+            surface_points=[Vector(0, 0, -5)],
+            interior_wires=[hole],
+        )
+        self.assertTrue(surface.is_valid())
+        self.assertEqual(surface.geom_type(), "BSPLINE")
+        bbox = surface.bounding_box()
+        self.assertVectorAlmostEquals(bbox.min, (-50.5, -24.5, -5.113393280136395), 5)
+        self.assertVectorAlmostEquals(bbox.max, (50.5, 24.5, 0), 5)
+
+        # With no surface point
+        surface = Face.make_surface(net_exterior)
+        bbox = surface.bounding_box()
+        self.assertVectorAlmostEquals(bbox.min, (-50.5, -24.5, -3), 5)
+        self.assertVectorAlmostEquals(bbox.max, (50.5, 24.5, 0), 5)
+
+        # Exterior Edge
+        surface = Face.make_surface([Edge.make_circle(50)], surface_points=[(0, 0, -5)])
+        bbox = surface.bounding_box()
+        self.assertVectorAlmostEquals(bbox.min, (-50, -50, -5), 5)
+        self.assertVectorAlmostEquals(bbox.max, (50, 50, 0), 5)
+
+    def test_make_surface_error_checking(self):
+        with self.assertRaises(ValueError):
+            Face.make_surface(Edge.make_line((0, 0), (1, 0)))
+
+        with self.assertRaises(RuntimeError):
+            Face.make_surface([Edge.make_line((0, 0), (1, 0))])
+
+        if platform.system() != "Darwin":
+            with self.assertRaises(RuntimeError):
+                Face.make_surface(
+                    [Edge.make_circle(50)], surface_points=[(0, 0, -50), (0, 0, 50)]
+                )
+
+            with self.assertRaises(RuntimeError):
+                Face.make_surface(
+                    [Edge.make_circle(50)],
+                    interior_wires=[Wire.make_circle(5, Plane.XZ)],
+                )
+
+    def test_sweep(self):
+        edge = Edge.make_line((1, 0), (2, 0))
+        path = Wire.make_circle(1)
+        circle_with_hole = Face.sweep(edge, path)
+        self.assertTrue(isinstance(circle_with_hole, Face))
+        self.assertAlmostEqual(circle_with_hole.area, math.pi * (2**2 - 1**1), 5)
+
+    def test_to_arcs(self):
+        with BuildSketch() as bs:
+            with BuildLine() as bl:
+                Polyline((0, 0), (1, 0), (1.5, 0.5), (2, 0), (2, 1), (0, 1), (0, 0))
+                fillet(bl.vertices(), radius=0.1)
+            make_face()
+        smooth = bs.faces()[0]
+        fragmented = smooth.to_arcs()
+        self.assertLess(len(smooth.edges()), len(fragmented.edges()))
 
 
 class TestFunctions(unittest.TestCase):
@@ -999,8 +1261,24 @@ class TestFunctions(unittest.TestCase):
         self.assertAlmostEqual(pnt[0], math.sqrt(3) / 2, 5)
         self.assertAlmostEqual(pnt[1], 0.5, 5)
 
+    def test_new_edges(self):
+        c = Solid.make_cylinder(1, 5)
+        s = Solid.make_sphere(2)
+        s_minus_c = s - c
+        seams = new_edges(c, s, combined=s_minus_c)
+        self.assertEqual(len(seams), 1)
+        self.assertAlmostEqual(seams[0].radius, 1, 5)
 
-class TestImportExport(unittest.TestCase):
+    def test_delta(self):
+        cyl = Solid.make_cylinder(1, 5)
+        sph = Solid.make_sphere(2)
+        con = Solid.make_cone(2, 1, 2)
+        plug = delta([cyl, sph, con], [sph, con])
+        self.assertEqual(len(plug), 1)
+        self.assertEqual(plug[0], cyl)
+
+
+class TestImportExport(DirectApiTestCase):
     def test_import_export(self):
         original_box = Solid.make_box(1, 1, 1)
         original_box.export_step("test_box.step")
@@ -1016,233 +1294,30 @@ class TestImportExport(unittest.TestCase):
         with self.assertRaises(ValueError):
             step_box = import_step("test_box.step")
 
+    def test_import_stl(self):
+        # export solid
+        original_box = Solid.make_box(1, 2, 3)
+        exporter = Mesher()
+        exporter.add_shape(original_box)
+        exporter.write("test.stl")
 
-class TestJoints(DirectApiTestCase):
-    def test_rigid_joint(self):
-        base = Solid.make_box(1, 1, 1)
-        j1 = RigidJoint("top", base, Location(Vector(0.5, 0.5, 1)))
-        fixed_top = Solid.make_box(1, 1, 1)
-        j2 = RigidJoint("bottom", fixed_top, Location((0.5, 0.5, 0)))
-        j1.connect_to(j2)
-        bbox = fixed_top.bounding_box()
-        self.assertVectorAlmostEquals(bbox.min, (0, 0, 1), 5)
-        self.assertVectorAlmostEquals(bbox.max, (1, 1, 2), 5)
+        # import as face
+        stl_box = import_stl("test.stl")
+        self.assertVectorAlmostEquals(stl_box.position, (0, 0, 0), 5)
 
-        self.assertVectorAlmostEquals(j2.symbol.location.position, (0.5, 0.5, 1), 6)
-        self.assertVectorAlmostEquals(j2.symbol.location.orientation, (0, 0, 0), 6)
 
-    def test_revolute_joint_with_angle_reference(self):
-        revolute_base = Solid.make_cylinder(1, 1)
-        j1 = RevoluteJoint(
-            label="top",
-            to_part=revolute_base,
-            axis=Axis((0, 0, 1), (0, 0, 1)),
-            angle_reference=(1, 0, 0),
-            angular_range=(0, 180),
-        )
-        fixed_top = Solid.make_box(1, 0.5, 1)
-        j2 = RigidJoint("bottom", fixed_top, Location((0.5, 0.25, 0)))
+class TestJupyter(DirectApiTestCase):
+    def test_repr_javascript(self):
+        shape = Solid.make_box(1, 1, 1)
 
-        j1.connect_to(j2, 90)
-        bbox = fixed_top.bounding_box()
-        self.assertVectorAlmostEquals(bbox.min, (-0.25, -0.5, 1), 5)
-        self.assertVectorAlmostEquals(bbox.max, (0.25, 0.5, 2), 5)
+        # Test no exception on rendering to js
+        js1 = shape._repr_javascript_()
 
-        self.assertVectorAlmostEquals(j2.symbol.location.position, (0, 0, 1), 6)
-        self.assertVectorAlmostEquals(j2.symbol.location.orientation, (0, 0, 90), 6)
-        self.assertEqual(len(j1.symbol.edges()), 2)
+        assert "function render" in js1
 
-    def test_revolute_joint_without_angle_reference(self):
-        revolute_base = Solid.make_cylinder(1, 1)
-        j1 = RevoluteJoint(
-            label="top",
-            to_part=revolute_base,
-            axis=Axis((0, 0, 1), (0, 0, 1)),
-        )
-        self.assertVectorAlmostEquals(j1.angle_reference, (1, 0, 0), 5)
-
-    def test_revolute_joint_error_bad_angle_reference(self):
-        """Test that the angle_reference must be normal to the axis"""
-        revolute_base = Solid.make_cylinder(1, 1)
-        with self.assertRaises(ValueError):
-            RevoluteJoint(
-                "top",
-                revolute_base,
-                axis=Axis((0, 0, 1), (0, 0, 1)),
-                angle_reference=(1, 0, 1),
-            )
-
-    def test_revolute_joint_error_bad_angle(self):
-        """Test that the joint angle is within bounds"""
-        revolute_base = Solid.make_cylinder(1, 1)
-        j1 = RevoluteJoint("top", revolute_base, Axis.Z, angular_range=(0, 180))
-        fixed_top = Solid.make_box(1, 0.5, 1)
-        j2 = RigidJoint("bottom", fixed_top, Location((0.5, 0.25, 0)))
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, 270)
-
-    def test_revolute_joint_error_bad_joint_type(self):
-        """Test that the joint angle is within bounds"""
-        revolute_base = Solid.make_cylinder(1, 1)
-        j1 = RevoluteJoint("top", revolute_base, Axis.Z, (0, 180))
-        fixed_top = Solid.make_box(1, 0.5, 1)
-        j2 = RevoluteJoint("bottom", fixed_top, Axis.Z, (0, 180))
-        with self.assertRaises(TypeError):
-            j1.connect_to(j2, 0)
-
-    def test_linear_rigid_joint(self):
-        base = Solid.make_box(1, 1, 1)
-        j1 = LinearJoint(
-            "top", to_part=base, axis=Axis((0, 0.5, 1), (1, 0, 0)), linear_range=(0, 1)
-        )
-        fixed_top = Solid.make_box(1, 1, 1)
-        j2 = RigidJoint("bottom", fixed_top, Location((0.5, 0.5, 0)))
-        j1.connect_to(j2, 0.25)
-        bbox = fixed_top.bounding_box()
-        self.assertVectorAlmostEquals(bbox.min, (-0.25, 0, 1), 5)
-        self.assertVectorAlmostEquals(bbox.max, (0.75, 1, 2), 5)
-
-        self.assertVectorAlmostEquals(j2.symbol.location.position, (0.25, 0.5, 1), 6)
-        self.assertVectorAlmostEquals(j2.symbol.location.orientation, (0, 0, 0), 6)
-
-    def test_linear_revolute_joint(self):
-        linear_base = Solid.make_box(1, 1, 1)
-        j1 = LinearJoint(
-            label="top",
-            to_part=linear_base,
-            axis=Axis((0, 0.5, 1), (1, 0, 0)),
-            linear_range=(0, 1),
-        )
-        revolute_top = Solid.make_box(1, 0.5, 1).locate(Location((-0.5, -0.25, 0)))
-        j2 = RevoluteJoint(
-            label="top",
-            to_part=revolute_top,
-            axis=Axis((0, 0, 0), (0, 0, 1)),
-            angle_reference=(1, 0, 0),
-            angular_range=(0, 180),
-        )
-        j1.connect_to(j2, position=0.25, angle=90)
-
-        bbox = revolute_top.bounding_box()
-        self.assertVectorAlmostEquals(bbox.min, (0, 0, 1), 5)
-        self.assertVectorAlmostEquals(bbox.max, (0.5, 1, 2), 5)
-
-        self.assertVectorAlmostEquals(j2.symbol.location.position, (0.25, 0.5, 1), 6)
-        self.assertVectorAlmostEquals(j2.symbol.location.orientation, (0, 0, 90), 6)
-        self.assertEqual(len(j1.symbol.edges()), 2)
-
-        # Test invalid position
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, position=5, angle=90)
-
-        # Test invalid angle
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, position=0.5, angle=270)
-
-        # Test invalid joint
-        with self.assertRaises(TypeError):
-            j1.connect_to(Solid.make_box(1, 1, 1), position=0.5, angle=90)
-
-    def test_cylindrical_joint(self):
-        cylindrical_base = (
-            Solid.make_box(1, 1, 1)
-            .locate(Location((-0.5, -0.5, 0)))
-            .cut(Solid.make_cylinder(0.3, 1))
-        )
-        j1 = CylindricalJoint(
-            "base",
-            cylindrical_base,
-            Axis((0, 0, 1), (0, 0, -1)),
-            angle_reference=(1, 0, 0),
-            linear_range=(0, 1),
-            angular_range=(0, 90),
-        )
-        dowel = Solid.make_cylinder(0.3, 1).cut(
-            Solid.make_box(1, 1, 1).locate(Location((-0.5, 0, 0)))
-        )
-        j2 = RigidJoint("bottom", dowel, Location((0, 0, 0), (0, 0, 0)))
-        j1.connect_to(j2, 0.25, 90)
-        dowel_bbox = dowel.bounding_box()
-        self.assertVectorAlmostEquals(dowel_bbox.min, (0, -0.3, -0.25), 5)
-        self.assertVectorAlmostEquals(dowel_bbox.max, (0.3, 0.3, 0.75), 5)
-
-        self.assertVectorAlmostEquals(j1.symbol.location.position, (0, 0, 1), 6)
-        self.assertVectorAlmostEquals(
-            j1.symbol.location.orientation, (-180, 0, -180), 6
-        )
-        self.assertEqual(len(j1.symbol.edges()), 2)
-
-        # Test invalid position
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, position=5, angle=90)
-
-        # Test invalid angle
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, position=0.5, angle=270)
-
-        # Test invalid joint
-        with self.assertRaises(TypeError):
-            j1.connect_to(Solid.make_box(1, 1, 1), position=0.5, angle=90)
-
-    def test_cylindrical_joint_error_bad_angle_reference(self):
-        """Test that the angle_reference must be normal to the axis"""
-        with self.assertRaises(ValueError):
-            CylindricalJoint(
-                "base",
-                Solid.make_box(1, 1, 1),
-                Axis((0, 0, 1), (0, 0, -1)),
-                angle_reference=(1, 0, 1),
-                linear_range=(0, 1),
-                angular_range=(0, 90),
-            )
-
-    def test_cylindrical_joint_error_bad_position_and_angle(self):
-        """Test that the joint angle is within bounds"""
-
-        j1 = CylindricalJoint(
-            "base",
-            Solid.make_box(1, 1, 1),
-            Axis((0, 0, 1), (0, 0, -1)),
-            linear_range=(0, 1),
-            angular_range=(0, 90),
-        )
-        j2 = RigidJoint("bottom", Solid.make_cylinder(1, 1), Location((0.5, 0.25, 0)))
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, position=0.5, angle=270)
-
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, position=4, angle=30)
-
-    def test_ball_joint(self):
-        socket_base = Solid.make_box(1, 1, 1).cut(
-            Solid.make_sphere(0.3, Plane((0.5, 0.5, 1)))
-        )
-        j1 = BallJoint(
-            "socket",
-            socket_base,
-            Location((0.5, 0.5, 1)),
-            angular_range=((-45, 45), (-45, 45), (0, 360)),
-        )
-        ball_rod = Solid.make_cylinder(0.15, 2).fuse(
-            Solid.make_sphere(0.3).locate(Location((0, 0, 2)))
-        )
-        j2 = RigidJoint("ball", ball_rod, Location((0, 0, 2), (180, 0, 0)))
-        j1.connect_to(j2, (45, 45, 0))
-        self.assertVectorAlmostEquals(
-            ball_rod.faces().filter_by(GeomType.PLANE)[0].center(CenterOf.GEOMETRY),
-            (1.914213562373095, -0.5, 2),
-            5,
-        )
-
-        self.assertVectorAlmostEquals(j1.symbol.location.position, (0.5, 0.5, 1), 6)
-        self.assertVectorAlmostEquals(j1.symbol.location.orientation, (0, 0, 0), 6)
-
-        with self.assertRaises(ValueError):
-            j1.connect_to(j2, (90, 45, 0))
-
-        # Test invalid joint
-        with self.assertRaises(TypeError):
-            j1.connect_to(Solid.make_box(1, 1, 1), (0, 0, 0))
+    def test_display_error(self):
+        with self.assertRaises(AttributeError):
+            display(Vector())
 
 
 class TestLocation(DirectApiTestCase):
@@ -1412,10 +1487,16 @@ class TestLocation(DirectApiTestCase):
         diff_posistion = Location((10, 20, 30), (4, 5, 6))
         diff_orientation = Location((1, 2, 3), (40, 50, 60))
         same = Location((1, 2, 3), (4, 5, 6))
-        
+
         self.assertEqual(loc, same)
         self.assertNotEqual(loc, diff_posistion)
         self.assertNotEqual(loc, diff_orientation)
+
+    def test_neg(self):
+        loc = Location((1, 2, 3), (0, 35, 127))
+        n_loc = -loc
+        self.assertVectorAlmostEquals(n_loc.position, (1, 2, 3), 5)
+        self.assertVectorAlmostEquals(n_loc.orientation, (180, -35, -127), 5)
 
 
 class TestMatrix(DirectApiTestCase):
@@ -1671,27 +1752,133 @@ class TestMixin1D(DirectApiTestCase):
         self.assertVectorAlmostEquals(locs[3].position, (0, -1, 0), 5)
         self.assertVectorAlmostEquals(locs[3].orientation, (0, 90, 90), 5)
 
-    # def test_project(self):
-    #     target = Face.make_rect(10, 10)
-    #     source = Face.make_from_wires(Wire.make_circle(1, Plane((0, 0, 1))))
-    #     shadow = source.project(target, direction=(0, 0, -1))
-    #     self.assertVectorAlmostEquals(shadow.center(), (0, 0, 0), 5)
-    #     self.assertAlmostEqual(shadow.area, math.pi, 5)
+    def test_project(self):
+        target = Face.make_rect(10, 10, Plane.XY.rotated((0, 45, 0)))
+        circle = Edge.make_circle(1).locate(Location((0, 0, 10)))
+        ellipse: Wire = circle.project(target, (0, 0, -1))
+        bbox = ellipse.bounding_box()
+        self.assertVectorAlmostEquals(bbox.min, (-1, -1, -1), 5)
+        self.assertVectorAlmostEquals(bbox.max, (1, 1, 1), 5)
+
+    def test_project2(self):
+        target = Cylinder(1, 10).faces().filter_by(GeomType.PLANE, reverse=True)[0]
+        square = Wire.make_rect(1, 1, Plane.YZ).locate(Location((10, 0, 0)))
+        projections: list[Wire] = square.project(
+            target, direction=(-1, 0, 0), closest=False
+        )
+        self.assertEqual(len(projections), 2)
+
+    def test_is_forward(self):
+        plate = Box(10, 10, 1) - Cylinder(1, 1)
+        hole_edges = plate.edges().filter_by(GeomType.CIRCLE)
+        self.assertTrue(hole_edges.sort_by(Axis.Z)[-1].is_forward)
+        self.assertFalse(hole_edges.sort_by(Axis.Z)[0].is_forward)
+
+    def test_offset_2d(self):
+        base_wire = Wire.make_polygon([(0, 0), (1, 0), (1, 1)], close=False)
+        corner = base_wire.vertices().group_by(Axis.Y)[0].sort_by(Axis.X)[-1]
+        base_wire = base_wire.fillet_2d(0.4, [corner])
+        offset_wire = base_wire.offset_2d(0.1, side=Side.LEFT)
+        self.assertTrue(offset_wire.is_closed())
+        self.assertEqual(len(offset_wire.edges().filter_by(GeomType.LINE)), 6)
+        self.assertEqual(len(offset_wire.edges().filter_by(GeomType.CIRCLE)), 2)
+        offset_wire_right = base_wire.offset_2d(0.1, side=Side.RIGHT)
+        self.assertAlmostEqual(
+            offset_wire_right.edges()
+            .filter_by(GeomType.CIRCLE)
+            .sort_by(SortBy.RADIUS)[-1]
+            .radius,
+            0.5,
+            4,
+        )
+
+        # Test for returned Edge - can't find a way to do this
+        # base_edge = Edge.make_circle(10, start_angle=40, end_angle=50)
+        # self.assertTrue(isinstance(offset_edge, Edge))
+        # offset_edge = base_edge.offset_2d(2, side=Side.RIGHT, closed=False)
+        # self.assertTrue(offset_edge.geom_type() == "CIRCLE")
+        # self.assertAlmostEqual(offset_edge.radius, 12, 5)
+        # base_edge = Edge.make_line((0, 1), (1, 10))
+        # offset_edge = base_edge.offset_2d(2, side=Side.RIGHT, closed=False)
+        # self.assertTrue(isinstance(offset_edge, Edge))
+        # self.assertTrue(offset_edge.geom_type() == "LINE")
+        # self.assertAlmostEqual(offset_edge.position_at(0).X, 3)
+
+    def test_common_plane(self):
+        # Straight and circular lines
+        l = Edge.make_line((0, 0, 0), (5, 0, 0))
+        c = Edge.make_circle(2, Plane.XZ, -90, 90)
+        common = l.common_plane(c)
+        self.assertAlmostEqual(common.z_dir.X, 0, 5)
+        self.assertAlmostEqual(abs(common.z_dir.Y), 1, 5)  # the direction isn't known
+        self.assertAlmostEqual(common.z_dir.Z, 0, 5)
+
+        # Co-axial straight lines
+        l1 = Edge.make_line((0, 0), (1, 1))
+        l2 = Edge.make_line((0.25, 0.25), (0.75, 0.75))
+        common = l1.common_plane(l2)
+        # the z_dir isn't know
+        self.assertAlmostEqual(common.x_dir.Z, 0, 5)
+
+        # Parallel lines
+        l1 = Edge.make_line((0, 0), (1, 0))
+        l2 = Edge.make_line((0, 1), (1, 1))
+        common = l1.common_plane(l2)
+        self.assertAlmostEqual(common.z_dir.X, 0, 5)
+        self.assertAlmostEqual(common.z_dir.Y, 0, 5)
+        self.assertAlmostEqual(abs(common.z_dir.Z), 1, 5)  # the direction isn't known
+
+        # Many lines
+        common = Edge.common_plane(*Wire.make_rect(10, 10).edges())
+        self.assertAlmostEqual(common.z_dir.X, 0, 5)
+        self.assertAlmostEqual(common.z_dir.Y, 0, 5)
+        self.assertAlmostEqual(abs(common.z_dir.Z), 1, 5)  # the direction isn't known
+
+        # Wire and Edges
+        c = Wire.make_circle(1, Plane.YZ)
+        lines = Wire.make_rect(2, 2, Plane.YZ).edges()
+        common = c.common_plane(*lines)
+        self.assertAlmostEqual(abs(common.z_dir.X), 1, 5)  # the direction isn't known
+        self.assertAlmostEqual(common.z_dir.Y, 0, 5)
+        self.assertAlmostEqual(common.z_dir.Z, 0, 5)
 
 
 class TestMixin3D(DirectApiTestCase):
     """Test that 3D add ins"""
-
     def test_chamfer(self):
+        box = Solid.make_box(1, 1, 1)
+        chamfer_box = box.chamfer(0.1, None, box.edges().sort_by(Axis.Z)[-1:])
+        self.assertAlmostEqual(chamfer_box.volume, 1 - 0.005, 5)
+
+    def test_chamfer_asym_length(self):
         box = Solid.make_box(1, 1, 1)
         chamfer_box = box.chamfer(0.1, 0.2, box.edges().sort_by(Axis.Z)[-1:])
         self.assertAlmostEqual(chamfer_box.volume, 1 - 0.01, 5)
 
-    def test_shell(self):
-        shell_box = Solid.make_box(1, 1, 1).shell([], thickness=-0.1)
+    def test_chamfer_asym_length_with_face(self):
+        box = Solid.make_box(1, 1, 1)
+        face = box.faces().sort_by(Axis.Z)[0]
+        edge = [face.edges().sort_by(Axis.Y)[0]]
+        chamfer_box = box.chamfer(0.1, 0.2, edge, face=face)
+        self.assertAlmostEqual(chamfer_box.volume, 1 - 0.01, 5)
+
+
+    def test_chamfer_too_high_length(self):
+        box = Solid.make_box(1, 1, 1)
+        face = box.faces
+        self.assertRaises(ValueError, box.chamfer, 2, None, box.edges().sort_by(Axis.Z)[-1:])
+
+    def test_chamfer_edge_not_part_of_face(self):
+        box = Solid.make_box(1, 1, 1)
+        edge = box.edges().sort_by(Axis.Z)[-1:]
+        face = box.faces().sort_by(Axis.Z)[0]
+        self.assertRaises(ValueError, box.chamfer, 0.1, None, edge, face=face)
+
+    def test_hollow(self):
+        shell_box = Solid.make_box(1, 1, 1).hollow([], thickness=-0.1)
         self.assertAlmostEqual(shell_box.volume, 1 - 0.8**3, 5)
         with self.assertRaises(ValueError):
-            Solid.make_box(1, 1, 1).shell([], thickness=0.1, kind=Kind.TANGENT)
+            Solid.make_box(1, 1, 1).hollow([], thickness=0.1, kind=Kind.TANGENT)
 
     def test_is_inside(self):
         self.assertTrue(Solid.make_box(1, 1, 1).is_inside((0.5, 0.5, 0.5)))
@@ -1746,20 +1933,20 @@ class TestPlane(DirectApiTestCase):
 
     def test_class_properties(self):
         """Validate
-        Name        xDir    yDir    zDir
-        =========== ======= ======= ======
-        XY          +x      +y      +z
-        YZ          +y      +z      +x
-        ZX          +z      +x      +y
-        XZ          +x      +z      -y
-        YX          +y      +x      -z
-        ZY          +z      +y      -x
-        front       +x      +y      +z
-        back        -x      +y      -z
-        left        +z      +y      -x
-        right       -z      +y      +x
-        top         +x      -z      +y
-        bottom      +x      +z      -y
+        Name    x_dir  y_dir  z_dir
+        ======= ====== ====== ======
+        XY      +x     +y     +z
+        YZ      +y     +z     +x
+        ZX      +z     +x     +y
+        XZ      +x     +z     -y
+        YX      +y     +x     -z
+        ZY      +z     +y     -x
+        front   +x     +z     -y
+        back    -x     +z     +y
+        left    -y     +z     -x
+        right   +y     +z     +x
+        top     +x     +y     +z
+        bottom  +x     -y     -z
         """
         planes = [
             (Plane.XY, (1, 0, 0), (0, 0, 1)),
@@ -1768,12 +1955,12 @@ class TestPlane(DirectApiTestCase):
             (Plane.XZ, (1, 0, 0), (0, -1, 0)),
             (Plane.YX, (0, 1, 0), (0, 0, -1)),
             (Plane.ZY, (0, 0, 1), (-1, 0, 0)),
-            (Plane.front, (1, 0, 0), (0, 0, 1)),
-            (Plane.back, (-1, 0, 0), (0, 0, -1)),
-            (Plane.left, (0, 0, 1), (-1, 0, 0)),
-            (Plane.right, (0, 0, -1), (1, 0, 0)),
-            (Plane.top, (1, 0, 0), (0, 1, 0)),
-            (Plane.bottom, (1, 0, 0), (0, -1, 0)),
+            (Plane.front, (1, 0, 0), (0, -1, 0)),
+            (Plane.back, (-1, 0, 0), (0, 1, 0)),
+            (Plane.left, (0, -1, 0), (-1, 0, 0)),
+            (Plane.right, (0, 1, 0), (1, 0, 0)),
+            (Plane.top, (1, 0, 0), (0, 0, 1)),
+            (Plane.bottom, (1, 0, 0), (0, 0, -1)),
         ]
         for plane, x_dir, z_dir in planes:
             self.assertVectorAlmostEquals(plane.x_dir, x_dir, 5)
@@ -1820,10 +2007,8 @@ class TestPlane(DirectApiTestCase):
                 p.y_dir, (-math.sqrt(2) / 2, math.sqrt(2) / 2, 0), 6
             )
             self.assertVectorAlmostEquals(p.z_dir, (0, 0, 1), 6)
-            self.assertVectorAlmostEquals(loc.position, p.to_location().position, 6)
-            self.assertVectorAlmostEquals(
-                loc.orientation, p.to_location().orientation, 6
-            )
+            self.assertVectorAlmostEquals(loc.position, p.location.position, 6)
+            self.assertVectorAlmostEquals(loc.orientation, p.location.orientation, 6)
 
         # rotated location around x and origin <> (0,0,0)
         loc = Location((0, 2, -1), (45, 0, 0))
@@ -1836,8 +2021,8 @@ class TestPlane(DirectApiTestCase):
         self.assertVectorAlmostEquals(
             p.z_dir, (0, -math.sqrt(2) / 2, math.sqrt(2) / 2), 6
         )
-        self.assertVectorAlmostEquals(loc.position, p.to_location().position, 6)
-        self.assertVectorAlmostEquals(loc.orientation, p.to_location().orientation, 6)
+        self.assertVectorAlmostEquals(loc.position, p.location.position, 6)
+        self.assertVectorAlmostEquals(loc.orientation, p.location.orientation, 6)
 
         # from a face
         f = Face.make_rect(1, 2).located(Location((1, 2, 3), (45, 0, 45)))
@@ -1852,11 +2037,9 @@ class TestPlane(DirectApiTestCase):
             self.assertVectorAlmostEquals(
                 p.z_dir, (0, -math.sqrt(2) / 2, math.sqrt(2) / 2), 6
             )
+            self.assertVectorAlmostEquals(f.location.position, p.location.position, 6)
             self.assertVectorAlmostEquals(
-                f.location.position, p.to_location().position, 6
-            )
-            self.assertVectorAlmostEquals(
-                f.location.orientation, p.to_location().orientation, 6
+                f.location.orientation, p.location.orientation, 6
             )
 
         # from a face with x_dir
@@ -1947,16 +2130,81 @@ class TestPlane(DirectApiTestCase):
         for i, target_point in enumerate(target_vertices):
             self.assertTupleAlmostEquals(target_point, local_box_vertices[i], 7)
 
+    def test_localize_vertex(self):
+        vertex = Vertex(random.random(), random.random(), random.random())
+        self.assertTupleAlmostEquals(
+            Plane.YZ.to_local_coords(vertex).to_tuple(),
+            Plane.YZ.to_local_coords(vertex.to_vector()).to_tuple(),
+            5,
+        )
+
     def test_repr(self):
         self.assertEqual(
             repr(Plane.XY),
             "Plane(o=(0.00, 0.00, 0.00), x=(1.00, 0.00, 0.00), z=(0.00, 0.00, 1.00))",
         )
 
-    def test_set_origin(self):
-        offset_plane = Plane.XY
-        offset_plane.set_origin2d(1, 1)
-        self.assertVectorAlmostEquals(offset_plane.origin, (1, 1, 0), 5)
+    def test_shift_origin_axis(self):
+        cyl = Cylinder(1, 2, align=Align.MIN)
+        top = cyl.faces().sort_by(Axis.Z)[-1]
+        pln = Plane(top).shift_origin(Axis.Z)
+        with BuildPart() as p:
+            add(cyl)
+            with BuildSketch(pln):
+                with Locations((1, 1)):
+                    Circle(0.5)
+            extrude(amount=-2, mode=Mode.SUBTRACT)
+        self.assertAlmostEqual(p.part.volume, math.pi * (1**2 - 0.5**2) * 2, 5)
+
+    def test_shift_origin_vertex(self):
+        box = Box(1, 1, 1, align=Align.MIN)
+        front = box.faces().sort_by(Axis.X)[-1]
+        pln = Plane(front).shift_origin(
+            front.vertices().group_by(Axis.Z)[-1].sort_by(Axis.Y)[-1]
+        )
+        with BuildPart() as p:
+            add(box)
+            with BuildSketch(pln):
+                with Locations((-0.5, 0.5)):
+                    Circle(0.5)
+            extrude(amount=-1, mode=Mode.SUBTRACT)
+        self.assertAlmostEqual(p.part.volume, 1**3 - math.pi * (0.5**2) * 1, 5)
+
+    def test_shift_origin_vector(self):
+        with BuildPart() as p:
+            Box(4, 4, 2)
+            b = fillet(p.edges().filter_by(Axis.Z), 0.5)
+            top = p.faces().sort_by(Axis.Z)[-1]
+            ref = (
+                top.edges()
+                .filter_by(GeomType.CIRCLE)
+                .group_by(Axis.X)[-1]
+                .sort_by(Axis.Y)[0]
+                .arc_center
+            )
+            pln = Plane(top, x_dir=(0, 1, 0)).shift_origin(ref)
+            with BuildSketch(pln):
+                with Locations((0.5, 0.5)):
+                    Rectangle(2, 2, align=Align.MIN)
+            extrude(amount=-1, mode=Mode.SUBTRACT)
+        self.assertAlmostEqual(p.part.volume, b.volume - 2**2 * 1, 5)
+
+    def test_shift_origin_error(self):
+        with self.assertRaises(ValueError):
+            Plane.XY.shift_origin(Vertex(1, 1, 1))
+
+        with self.assertRaises(ValueError):
+            Plane.XY.shift_origin((1, 1, 1))
+
+        with self.assertRaises(ValueError):
+            Plane.XY.shift_origin(Axis((0, 0, 1), (0, 1, 0)))
+
+        with self.assertRaises(TypeError):
+            Plane.XY.shift_origin(Edge.make_line((0, 0), (1, 1)))
+
+    def test_move(self):
+        pln = Plane.XY.move(Location((1, 2, 3)))
+        self.assertVectorAlmostEquals(pln.origin, (1, 2, 3), 5)
 
     def test_rotated(self):
         rotated_plane = Plane.XY.rotated((45, 0, 0))
@@ -2017,9 +2265,47 @@ class TestPlane(DirectApiTestCase):
         )
 
     def test_to_location(self):
-        loc = Plane(origin=(1, 2, 3), x_dir=(0, 1, 0), z_dir=(0, 0, 1)).to_location()
+        loc = Plane(origin=(1, 2, 3), x_dir=(0, 1, 0), z_dir=(0, 0, 1)).location
         self.assertVectorAlmostEquals(loc.position, (1, 2, 3), 5)
         self.assertVectorAlmostEquals(loc.orientation, (0, 0, 90), 5)
+
+    def test_find_intersection(self):
+        self.assertVectorAlmostEquals(
+            Plane.XY.find_intersection(Axis((1, 2, 3), (0, 0, -1))), (1, 2, 0), 5
+        )
+        self.assertIsNone(Plane.XY.find_intersection(Axis((1, 2, 3), (0, 1, 0))))
+
+    def test_from_non_planar_face(self):
+        flat = Face.make_rect(1, 1)
+        pln = Plane(flat)
+        self.assertTrue(isinstance(pln, Plane))
+        cyl = (
+            Solid.make_cylinder(1, 4).faces().filter_by(GeomType.PLANE, reverse=True)[0]
+        )
+        with self.assertRaises(ValueError):
+            pln = Plane(cyl)
+
+    def test_plane_intersect(self):
+        section = Plane.XY.intersect(Solid.make_box(1, 2, 3, Plane.XY.offset(-1.5)))
+        self.assertEqual(len(section.solids()), 0)
+        self.assertEqual(len(section.faces()), 1)
+        self.assertAlmostEqual(section.face().area, 2)
+
+        section = Plane.XY & Solid.make_box(1, 2, 3, Plane.XY.offset(-1.5))
+        self.assertEqual(len(section.solids()), 0)
+        self.assertEqual(len(section.faces()), 1)
+        self.assertAlmostEqual(section.face().area, 2)
+
+        # intersect part II
+        # x_axis_as_edge = Plane.XY & Plane.XZ
+        # common = (x_axis_as_edge.intersect(Edge.make_line((0, 0, 0), (1, 0, 0)))).edge()
+        # self.assertAlmostEqual(common.length, 1, 5)
+
+    def test_plane_origin_setter(self):
+        pln = Plane.XY
+        pln.origin = (1, 2, 3)
+        ocp_origin = Vector(pln.wrapped.Location())
+        self.assertVectorAlmostEquals(ocp_origin, (1, 2, 3), 5)
 
 
 class TestProjection(DirectApiTestCase):
@@ -2037,21 +2323,16 @@ class TestProjection(DirectApiTestCase):
         ]
         self.assertEqual(len(projected_text_faces), 4)
 
-    # def test_conical_projection(self):
-    #     sphere = Solid.make_sphere(50)
-    #     projection_center = Vector(0, 0, 0)
-    #     planar_text_faces = (
-    #         Compound.make_text("Conical", 25, halign=Halign.CENTER)
-    #         .rotate(Axis.X, 90)
-    #         .translate((0, -60, 0))
-    #         .faces()
-    #     )
-
-    #     projected_text_faces = [
-    #         f.project_to_shape(sphere, center=projection_center)[0]
-    #         for f in planar_text_faces
-    #     ]
-    #     self.assertEqual(len(projected_text_faces), 8)
+    def test_multiple_output_wires(self):
+        target = Box(10, 10, 4) - Pos((0, 0, 2)) * Box(5, 5, 2)
+        circle = Wire.make_circle(3, Plane.XY.offset(10))
+        projection = circle.project_to_shape(target, (0, 0, -1))
+        bbox = projection[0].bounding_box()
+        self.assertVectorAlmostEquals(bbox.min, (-3, -3, 1), 2)
+        self.assertVectorAlmostEquals(bbox.max, (3, 3, 2), 2)
+        bbox = projection[1].bounding_box()
+        self.assertVectorAlmostEquals(bbox.min, (-3, -3, -2), 2)
+        self.assertVectorAlmostEquals(bbox.max, (3, 3, -2), 2)
 
     def test_text_projection(self):
         sphere = Solid.make_sphere(50)
@@ -2072,14 +2353,11 @@ class TestProjection(DirectApiTestCase):
         self.assertEqual(len(projected_text.solids()), 0)
         self.assertEqual(len(projected_text.faces()), 3)
 
-    # def test_error_handling(self):
-    #     sphere = Solid.make_sphere(50)
-    #     f = Face.make_rect(10, 10)
-    #     with self.assertRaises(ValueError):
-    #         f.project_to_shape(sphere, center=None, direction=None)[0]
-    #     w = Face.make_rect(10, 10).outer_wire()
-    #     with self.assertRaises(ValueError):
-    #         w.project_to_shape(sphere, center=None, direction=None)[0]
+    def test_error_handling(self):
+        sphere = Solid.make_sphere(50)
+        circle = Wire.make_circle(1)
+        with self.assertRaises(ValueError):
+            circle.project_to_shape(sphere, center=None, direction=None)[0]
 
     def test_project_edge(self):
         projection = Edge.make_circle(1, Plane.XY.offset(-5)).project_to_shape(
@@ -2152,10 +2430,15 @@ class TestShape(DirectApiTestCase):
         self.assertTrue(box.faces().sort_by(sort_by=Axis.Z)[-1] in intersected_faces)
 
     def test_split(self):
-        box = Solid.make_box(1, 1, 1, Plane((-0.5, 0, 0)))
-        # halves = box.split(Face.make_rect(2, 2, normal=(1, 0, 0)))
-        halves = box.split(Face.make_rect(2, 2, Plane.YZ))
-        self.assertEqual(len(halves.solids()), 2)
+        shape = Box(1, 1, 1) - Pos((0, 0, -0.25)) * Box(1, 0.5, 0.5)
+        split_shape = shape.split(Plane.XY, keep=Keep.BOTTOM)
+        self.assertEqual(len(split_shape.solids()), 2)
+        self.assertAlmostEqual(split_shape.volume, 0.25, 5)
+        self.assertTrue(isinstance(split_shape, Compound))
+        split_shape = shape.split(Plane.XY, keep=Keep.TOP)
+        self.assertEqual(len(split_shape.solids()), 1)
+        self.assertTrue(isinstance(split_shape, Solid))
+        self.assertAlmostEqual(split_shape.volume, 0.5, 5)
 
     def test_distance(self):
         sphere1 = Solid.make_sphere(1, Plane((-5, 0, 0)))
@@ -2206,18 +2489,6 @@ class TestShape(DirectApiTestCase):
         verts, triangles = box123.tessellate(1e-6)
         self.assertEqual(len(verts), 24)
         self.assertEqual(len(triangles), 12)
-
-    # def test_to_vtk_poly_data(self):
-
-    #     from vtkmodules.vtkCommonDataModel import vtkPolyData
-
-    #     f = Face.make_rect(2, 2)
-    #     vtk = f.to_vtk_poly_data(normals=False)
-    #     self.assertTrue(isinstance(vtk, vtkPolyData))
-    #     self.assertEqual(vtk.GetNumberOfPolys(), 2)
-
-    # def test_repr_javascript_(self):
-    #     print(Shape._repr_javascript_(Face))
 
     def test_transformed(self):
         """Validate that transformed works the same as changing location"""
@@ -2289,6 +2560,75 @@ class TestShape(DirectApiTestCase):
         bbox2 = box_with_hole.bounding_box()
         self.assertVectorAlmostEquals(bbox1.min, bbox2.min, 5)
         self.assertVectorAlmostEquals(bbox1.max, bbox2.max, 5)
+
+    def test_project_to_viewport(self):
+        # Basic test
+        box = Solid.make_box(10, 10, 10)
+        visible, hidden = box.project_to_viewport((-20, 20, 20))
+        self.assertEqual(len(visible), 9)
+        self.assertEqual(len(hidden), 3)
+
+        # Contour edges
+        cyl = Solid.make_cylinder(2, 10)
+        visible, hidden = cyl.project_to_viewport((-20, 20, 20))
+        # Note that some edges are broken into two
+        self.assertEqual(len(visible), 6)
+        self.assertEqual(len(hidden), 2)
+
+        # Hidden coutour edges
+        hole = box - cyl
+        visible, hidden = hole.project_to_viewport((-20, 20, 20))
+        self.assertEqual(len(visible), 13)
+        self.assertEqual(len(hidden), 6)
+
+        # Outline edges
+        sphere = Solid.make_sphere(5)
+        visible, hidden = sphere.project_to_viewport((-20, 20, 20))
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(len(hidden), 0)
+
+    def test_vertex(self):
+        v = Edge.make_circle(1).vertex()
+        self.assertTrue(isinstance(v, Vertex))
+        with self.assertWarns(UserWarning):
+            Wire.make_rect(1, 1).vertex()
+
+    def test_edge(self):
+        e = Edge.make_circle(1).edge()
+        self.assertTrue(isinstance(e, Edge))
+        with self.assertWarns(UserWarning):
+            Wire.make_rect(1, 1).edge()
+
+    def test_wire(self):
+        w = Wire.make_circle(1).wire()
+        self.assertTrue(isinstance(w, Wire))
+        with self.assertWarns(UserWarning):
+            Solid.make_box(1, 1, 1).wire()
+
+    def test_compound(self):
+        c = Compound.make_text("hello", 10)
+        self.assertTrue(isinstance(c, Compound))
+        c2 = Compound.make_text("world", 10)
+        with self.assertWarns(UserWarning):
+            Compound(children=[c, c2]).compound()
+
+    def test_face(self):
+        f = Face.make_rect(1, 1)
+        self.assertTrue(isinstance(f, Face))
+        with self.assertWarns(UserWarning):
+            Solid.make_box(1, 1, 1).face()
+
+    def test_shell(self):
+        s = Solid.make_sphere(1).shell()
+        self.assertTrue(isinstance(s, Shell))
+        with self.assertWarns(UserWarning):
+            extrude(Compound.make_text("two", 10), amount=5).shell()
+
+    def test_solid(self):
+        s = Solid.make_sphere(1).solid()
+        self.assertTrue(isinstance(s, Solid))
+        with self.assertWarns(UserWarning):
+            Solid.make_sphere(1).split(Plane.XY, keep=Keep.BOTH).solid()
 
 
 class TestShapeList(DirectApiTestCase):
@@ -2429,9 +2769,87 @@ class TestShapeList(DirectApiTestCase):
             Box(1, 1, 1)
         self.assertEqual(len(box.edges().sort_by_distance((0, 0, 0))), 12)
 
+    def test_vertices(self):
+        sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
+        self.assertEqual(len(sl.vertices()), 8)
+
+    def test_vertex(self):
+        sl = ShapeList([Edge.make_circle(1)])
+        self.assertTupleAlmostEquals(sl.vertex().to_tuple(), (1, 0, 0), 5)
+        sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
+        with self.assertWarns(UserWarning):
+            sl.vertex()
+
+    def test_edges(self):
+        sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
+        self.assertEqual(len(sl.edges()), 8)
+
+    def test_edge(self):
+        sl = ShapeList([Edge.make_circle(1)])
+        self.assertAlmostEqual(sl.edge().length, 2 * 1 * math.pi, 5)
+        sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
+        with self.assertWarns(UserWarning):
+            sl.edge()
+
+    def test_wires(self):
+        sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
+        self.assertEqual(len(sl.wires()), 2)
+
+    def test_wire(self):
+        sl = ShapeList([Wire.make_circle(1)])
+        self.assertAlmostEqual(sl.wire().length, 2 * 1 * math.pi, 5)
+        sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
+        with self.assertWarns(UserWarning):
+            sl.wire()
+
+    def test_faces(self):
+        sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
+        self.assertEqual(len(sl.faces()), 9)
+
+    def test_face(self):
+        sl = ShapeList(
+            [Vertex(1, 1, 1), Edge.make_line((0, 0), (1, 1)), Face.make_rect(2, 1)]
+        )
+        self.assertAlmostEqual(sl.face().area, 2 * 1, 5)
+        sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
+        with self.assertWarns(UserWarning):
+            sl.face()
+
+    def test_shells(self):
+        sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
+        self.assertEqual(len(sl.shells()), 2)
+
+    def test_shell(self):
+        sl = ShapeList([Vertex(1, 1, 1), Solid.make_box(1, 1, 1)])
+        self.assertAlmostEqual(sl.shell().area, 6 * 1 * 1, 5)
+        sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
+        with self.assertWarns(UserWarning):
+            sl.shell()
+
+    def test_solids(self):
+        sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
+        self.assertEqual(len(sl.solids()), 2)
+
+    def test_solid(self):
+        sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
+        with self.assertWarns(UserWarning):
+            sl.solid()
+        sl = ShapeList([Solid.make_box(1, 2, 3), Vertex(1, 1, 1)])
+        self.assertAlmostEqual(sl.solid().volume, 1 * 2 * 3, 5)
+
+    def test_compounds(self):
+        sl = ShapeList([Box(1, 1, 1), Cylinder(1, 1)])
+        self.assertEqual(len(sl.compounds()), 2)
+
+    def test_compound(self):
+        sl = ShapeList([Box(1, 1, 1), Cylinder(1, 1)])
+        with self.assertWarns(UserWarning):
+            sl.compound()
+        sl = ShapeList([Box(1, 2, 3), Vertex(1, 1, 1)])
+        self.assertAlmostEqual(sl.compound().volume, 1 * 2 * 3, 5)
 
 
-class TestShell(DirectApiTestCase):
+class TestShells(DirectApiTestCase):
     def test_shell_init(self):
         box_faces = Solid.make_box(1, 1, 1).faces()
         box_shell = Shell.make_shell(box_faces)
@@ -2452,21 +2870,94 @@ class TestSolid(DirectApiTestCase):
         self.assertAlmostEqual(box.volume, 1, 5)
         self.assertTrue(box.is_valid())
 
-    def test_extrude_with_taper(self):
-        base = Face.make_rect(1, 1)
-        pyramid = Solid.extrude_linear(base, normal=(0, 0, 1), taper=10)
-        self.assertLess(
-            pyramid.faces().sort_by(Axis.Z)[-1].area,
-            pyramid.faces().sort_by(Axis.Z)[0].area,
-        )
-        self.assertVectorAlmostEquals(pyramid.bounding_box().size, (1, 1, 1), 5)
+    def test_extrude(self):
+        v = Edge.extrude(Vertex(1, 1, 1), (0, 0, 1))
+        self.assertAlmostEqual(v.length, 1, 5)
 
-        inner = Solid.extrude_linear(
-            Face.make_rect(0.5, 0.5), normal=(0, 0, 1), taper=10
+        e = Face.extrude(Edge.make_line((2, 1), (2, 0)), (0, 0, 1))
+        self.assertAlmostEqual(e.area, 1, 5)
+
+        w = Shell.extrude(
+            Wire.make_wire(
+                [Edge.make_line((1, 1), (0, 2)), Edge.make_line((1, 1), (1, 0))]
+            ),
+            (0, 0, 1),
         )
-        hollow_base = Face.make_rect(1, 1).cut(Face.make_rect(0.5, 0.5)).faces()[0]
-        hollow_pyramid = Solid.extrude_linear(hollow_base, normal=(0, 0, 1), taper=10)
-        self.assertAlmostEqual(hollow_pyramid.volume + inner.volume, pyramid.volume, 4)
+        self.assertAlmostEqual(w.area, 1 + math.sqrt(2), 5)
+
+        f = Solid.extrude(Face.make_rect(1, 1), (0, 0, 1))
+        self.assertAlmostEqual(f.volume, 1, 5)
+
+        s = Compound.extrude(
+            Shell.make_shell(
+                Solid.make_box(1, 1, 1)
+                .locate(Location((-2, 1, 0)))
+                .faces()
+                .sort_by(Axis((0, 0, 0), (1, 1, 1)))[-2:]
+            ),
+            (0.1, 0.1, 0.1),
+        )
+        self.assertAlmostEqual(s.volume, 0.2, 5)
+
+        with self.assertRaises(ValueError):
+            Solid.extrude(Solid.make_box(1, 1, 1), (0, 0, 1))
+
+    def test_extrude_taper(self):
+        a = 1
+        rect = Face.make_rect(a, a)
+        flipped = -rect
+        for direction in [Vector(0, 0, 2), Vector(0, 0, -2)]:
+            for taper in [10, -10]:
+                offset_amt = -direction.length * math.tan(math.radians(taper))
+                for face in [rect, flipped]:
+                    with self.subTest(
+                        f"{direction=}, {taper=}, flipped={face==flipped}"
+                    ):
+                        taper_solid = Solid.extrude_taper(face, direction, taper)
+                        # V = 1/3 × h × (a² + b² + ab)
+                        h = Vector(direction).length
+                        b = a + 2 * offset_amt
+                        v = h * (a**2 + b**2 + a * b) / 3
+                        self.assertAlmostEqual(taper_solid.volume, v, 5)
+                        bbox = taper_solid.bounding_box()
+                        size = max(1, b) / 2
+                        if direction.Z > 0:
+                            self.assertVectorAlmostEquals(
+                                bbox.min, (-size, -size, 0), 1
+                            )
+                            self.assertVectorAlmostEquals(bbox.max, (size, size, h), 1)
+                        else:
+                            self.assertVectorAlmostEquals(
+                                bbox.min, (-size, -size, -h), 1
+                            )
+                            self.assertVectorAlmostEquals(bbox.max, (size, size, 0), 1)
+
+    def test_extrude_taper_with_hole(self):
+        rect_hole = Face.make_rect(1, 1).make_holes([Wire.make_circle(0.25)])
+        direction = Vector(0, 0, 0.5)
+        taper = 10
+        taper_solid = Solid.extrude_taper(rect_hole, direction, taper)
+        offset_amt = -direction.length * math.tan(math.radians(taper))
+        hole = taper_solid.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[-1]
+        self.assertAlmostEqual(hole.radius, 0.25 - offset_amt, 5)
+
+    def test_extrude_taper_with_hole_flipped(self):
+        rect_hole = Face.make_rect(1, 1).make_holes([Wire.make_circle(0.25)])
+        direction = Vector(0, 0, 1)
+        taper = 10
+        taper_solid_t = Solid.extrude_taper(rect_hole, direction, taper, True)
+        taper_solid_f = Solid.extrude_taper(rect_hole, direction, taper, False)
+        hole_t = taper_solid_t.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[-1]
+        hole_f = taper_solid_f.edges().filter_by(GeomType.CIRCLE).sort_by(Axis.Z)[-1]
+        self.assertGreater(hole_t.radius, hole_f.radius)
+
+    def test_extrude_taper_oblique(self):
+        rect = Face.make_rect(2, 1)
+        rect_hole = rect.make_holes([Wire.make_circle(0.25)])
+        o_rect_hole = rect_hole.moved(Location((0, 0, 0), (1, 0.1, 0), 77))
+        taper0 = Solid.extrude_taper(rect_hole, (0, 0, 1), 5)
+        taper1 = Solid.extrude_taper(o_rect_hole, o_rect_hole.normal_at(), 5)
+        self.assertAlmostEqual(taper0.volume, taper1.volume, 5)
 
     def test_extrude_linear_with_rotation(self):
         # Face
@@ -2503,54 +2994,18 @@ class TestSolid(DirectApiTestCase):
         extrusion = Solid.extrude_until(square, box, (0, 0, 1), Until.LAST)
         self.assertAlmostEqual(extrusion.volume, 4, 5)
 
+    def test_sweep(self):
+        path = Edge.make_spline([(0, 0), (3, 5), (7, -2)])
+        section = Wire.make_circle(1, Plane(path @ 0, z_dir=path % 0))
+        area = Face.make_from_wires(section).area
+        swept = Solid.sweep(section, path)
+        self.assertAlmostEqual(swept.volume, path.length * area, 0)
 
-class TestSVG(unittest.TestCase):
-    def test_svg_export_import(self):
-        with BuildSketch() as square:
-            Rectangle(1, 1)
-        square.sketch.export_svg(
-            "test_svg.svg", (10, -10, 10), (0, 0, 1), svg_opts={"show_axes": False}
-        )
-        svg_imported = import_svg("test_svg.svg")
-        self.assertEqual(len(svg_imported), 4)
-
-        with BuildSketch() as square:
-            Circle(1)
-        square.sketch.export_svg(
-            "test_svg.svg", (0, 0, 10), (0, 1, 0), svg_opts={"show_axes": True}
-        )
-        svg_imported = import_svg("test_svg.svg")
-        self.assertGreater(len(svg_imported), 1)
-
-        box = Solid.make_box(1, 1, 1)
-        box.export_svg(
-            "test_svg.svg",
-            (10, -10, 10),
-            (0, 0, 1),
-            svg_opts={"show_axes": False, "pixel_scale": 100, "stroke_width": 1},
-        )
-        svg_imported = import_svg("test_svg.svg")
-        self.assertEqual(len(svg_imported), 16)
-
-        box = Solid.make_box(1, 1, 1)
-        box.export_svg(
-            "test_svg.svg",
-            (10, -10, 10),
-            (0, 0, 1),
-            svg_opts={
-                "show_axes": False,
-                "pixel_scale": 100,
-                "stroke_width": 1,
-                "show_hidden": False,
-            },
-        )
-        svg_imported = import_svg("test_svg.svg")
-        self.assertEqual(len(svg_imported), 9)
-
-        os.remove("test_svg.svg")
-
-        with self.assertRaises(ValueError):
-            import_svg("test_svg.svg")
+    def test_hollow_sweep(self):
+        path = Edge.make_line((0, 0, 0), (0, 0, 5))
+        section = (Rectangle(1, 1) - Rectangle(0.1, 0.1)).faces()[0]
+        swept = Solid.sweep(section, path)
+        self.assertAlmostEqual(swept.volume, 5 * (1 - 0.1**2), 5)
 
 
 class TestVector(DirectApiTestCase):
@@ -2719,8 +3174,19 @@ class TestVector(DirectApiTestCase):
         self.assertVectorAlmostEquals(v2, (1, 2, 3), 7)
         self.assertVectorAlmostEquals(v3, (1, 2, 3), 7)
 
+    def test_radd(self):
+        vectors = [Vector(1, 2, 3), Vector(4, 5, 6), Vector(7, 8, 9)]
+        vector_sum = sum(vectors)
+        self.assertVectorAlmostEquals(vector_sum, (12, 15, 18), 5)
 
-class VertexTests(DirectApiTestCase):
+    def test_hash(self):
+        vectors = [Vector(1, 2, 3), Vector(4, 5, 6), Vector(7, 8, 9), Vector(1, 2, 3)]
+        unique_vectors = list(set(vectors))
+        self.assertEqual(len(vectors), 4)
+        self.assertEqual(len(unique_vectors), 3)
+
+
+class TestVertex(DirectApiTestCase):
     """Test the extensions to the cadquery Vertex class"""
 
     def test_basic_vertex(self):
@@ -2775,18 +3241,22 @@ class VertexTests(DirectApiTestCase):
         self.assertIsInstance(Vertex(0, 0, 0).to_vector(), Vector)
         self.assertVectorAlmostEquals(Vertex(0, 0, 0).to_vector(), (0.0, 0.0, 0.0), 7)
 
+    def test_vertex_init_error(self):
+        with self.assertRaises(ValueError):
+            Vertex(0.0, 1.0)
 
-class TestWire(unittest.TestCase):
+    def test_no_intersect(self):
+        with self.assertRaises(NotImplementedError):
+            Vertex(1, 2, 3) & Vertex(5, 6, 7)
+
+
+class TestWire(DirectApiTestCase):
     def test_ellipse_arc(self):
         full_ellipse = Wire.make_ellipse(2, 1)
         half_ellipse = Wire.make_ellipse(
             2, 1, start_angle=0, end_angle=180, closed=True
         )
         self.assertAlmostEqual(full_ellipse.area / 2, half_ellipse.area, 5)
-
-    def test_conical_helix(self):
-        helix = Wire.make_helix(1, 4, 1, normal=(-1, 0, 0), angle=10, lefthand=True)
-        self.assertAlmostEqual(helix.length, 34.102023034708374, 5)
 
     def test_stitch(self):
         half_ellipse1 = Wire.make_ellipse(
@@ -2807,10 +3277,17 @@ class TestWire(unittest.TestCase):
 
     def test_chamfer_2d(self):
         square = Wire.make_rect(1, 1)
-        squaroid = square.chamfer_2d(0.1, square.vertices())
+        squaroid = square.chamfer_2d(0.1, 0.1, square.vertices())
         self.assertAlmostEqual(
             squaroid.length, 4 * (1 - 2 * 0.1 + 0.1 * math.sqrt(2)), 5
         )
+
+    def test_chamfer_2d_edge(self):
+        square = Wire.make_rect(1, 1)
+        edge = square.edges().sort_by(Axis.Y)[0]
+        vertex = edge.vertices().sort_by(Axis.X)[0]
+        square = square.chamfer_2d(distance=0.1, distance2=0.2,vertices=[vertex], edge=edge)
+        self.assertAlmostEqual(square.edges().sort_by(Axis.Y)[0].length, 0.9)
 
     def test_make_convex_hull(self):
         # overlapping_edges = [
@@ -2828,6 +3305,60 @@ class TestWire(unittest.TestCase):
         ]
         hull_wire = Wire.make_convex_hull(adjoining_edges)
         self.assertAlmostEqual(Face.make_from_wires(hull_wire).area, 319.9612, 4)
+
+    # def test_fix_degenerate_edges(self):
+    #     # Can't find a way to create one
+    #     edge0 = Edge.make_line((0, 0, 0), (1, 0, 0))
+    #     edge1 = Edge.make_line(edge0 @ 0, edge0 @ 0 + Vector(0, 1, 0))
+    #     edge1a = edge1.trim(0, 1e-7)
+    #     edge1b = edge1.trim(1e-7, 1.0)
+    #     edge2 = Edge.make_line(edge1 @ 1, edge1 @ 1 + Vector(1, 1, 0))
+    #     wire = Wire.make_wire([edge0, edge1a, edge1b, edge2])
+    #     fixed_wire = wire.fix_degenerate_edges(1e-6)
+    #     self.assertEqual(len(fixed_wire.edges()), 2)
+
+    def test_trim(self):
+        e0 = Edge.make_line((0, 0), (1, 0))
+        e1 = Edge.make_line((2, 0), (1, 0))
+        e2 = Edge.make_line((2, 0), (3, 0))
+        w1 = Wire.make_wire([e0, e1, e2])
+        t1 = w1.trim(0.2, 0.9).move(Location((0, 0.1, 0)))
+        self.assertAlmostEqual(t1.length, 2.1, 5)
+
+        e = Edge.make_three_point_arc((0, -20), (5, 0), (0, 20))
+        # Three edges are created 0->0.5->0.75->1.0
+        o = e.offset_2d(10, side=Side.RIGHT, closed=False)
+        t2 = o.trim(0.1, 0.9)
+        self.assertAlmostEqual(t2.length, o.length * 0.8, 5)
+
+        t3 = o.trim(0.5, 1.0)
+        self.assertAlmostEqual(t3.length, o.length * 0.5, 5)
+
+        t4 = o.trim(0.5, 0.75)
+        self.assertAlmostEqual(t4.length, o.length * 0.25, 5)
+
+        with self.assertRaises(ValueError):
+            o.trim(0.75, 0.25)
+
+    def test_param_at_point(self):
+        e = Edge.make_three_point_arc((0, -20), (5, 0), (0, 20))
+        # Three edges are created 0->0.5->0.75->1.0
+        o = e.offset_2d(10, side=Side.RIGHT, closed=False)
+
+        e0 = Edge.make_line((0, 0), (1, 0))
+        e1 = Edge.make_line((2, 0), (1, 0))
+        e2 = Edge.make_line((2, 0), (3, 0))
+        w1 = Wire.make_wire([e0, e1, e2])
+        for wire in [o, w1]:
+            u_value = random.random()
+            position = wire.position_at(u_value)
+            self.assertAlmostEqual(wire.param_at_point(position), u_value, 4)
+
+        with self.assertRaises(ValueError):
+            o.param_at_point((-1, 1))
+
+        with self.assertRaises(ValueError):
+            w1.param_at_point((20, 20, 20))
 
 
 if __name__ == "__main__":

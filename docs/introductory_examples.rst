@@ -14,7 +14,7 @@ They are organized from simple to complex, so working through them in order is t
        2. If you are using Build123d *context mode*,
 
             - in *CQ-editor* add e.g. ``show_object(ex15.part)``, ``show_object(ex15.sketch)`` or ``show_object(ex15.line)`` to view parts, sketches or lines.
-            - in *ocp_vscode* simply use ``show_object(ex15)`` for parts, sketches and curves.
+            - in *ocp_vscode* simply use e.g. ``show_object(ex15)`` for parts, sketches and curves.
 
        3. If you are using Build123d *algebra mode*, add the line e.g. ``show_object(ex15)`` for parts, sketches and curves at the end.
        4. If you want to save your resulting file as an STL, it is currently best to use e.g. ``ex15.part.export_stl("file.stl")``.
@@ -264,7 +264,7 @@ create the final profile.
 This example introduces multiple useful and important concepts. Firstly :meth:`~operations_generic.chamfer`
 and :meth:`~operations_generic.fillet` can be used to "bevel" and "round" edges respectively. Secondly,
 these two methods require an edge or a list of edges to operate on. To select all
-edges, you could simply pass in ``*ex9.edges()`` (the star ``*`` operator unpacks the list).
+edges, you could simply pass in ``ex9.edges()``.
 
 .. image:: assets/general_ex9.svg
     :align: center
@@ -435,7 +435,7 @@ consuming, and more difficult to maintain.
 
 * **Builder mode**
 
-    The :meth:`~operations_part.sweep` method takes any pending faces and sweeps them through the provided
+    The :meth:`~operations_generic.sweep` method takes any pending faces and sweeps them through the provided
     path (in this case the path is taken from the pending edges from ``ex14_ln``).
     :meth:`~operations_part.revolve` requires a single connected wire. The pending faces must lie on the
     path.
@@ -446,7 +446,7 @@ consuming, and more difficult to maintain.
 
 * **Algebra mode**
 
-    The :meth:`~operations_part.sweep` method takes any faces and sweeps them through the provided
+    The :meth:`~operations_generic.sweep` method takes any faces and sweeps them through the provided
     path (in this case the path is taken from the pending edges from ``ex14_ln``).
 
     .. literalinclude:: general_examples_algebra.py

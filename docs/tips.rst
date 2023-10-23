@@ -13,7 +13,7 @@ Can't Get There from Here
 Unfortunately, it's a reality that not all parts described using build123d can be
 successfully constructed by the underlying CAD core. Designers may have to
 explore different design approaches to get the OpenCascade CAD core to successfully
-build the target object. For instance, if a multi-section :func:`~operations_part.sweep`
+build the target object. For instance, if a multi-section :func:`~operations_generic.sweep`
 operation fails, a :func:`~operations_part.loft` operation may be a viable alternative
 in certain situations. It's crucial to remember that CAD is a complex field and
 patience may be required to achieve the desired results.
@@ -109,3 +109,30 @@ belongs to then select the edges as shown here:
         hole_edges = top_face.edges().filter_by(GeomType.CIRCLE)
         chamfer(hole_edges, length=1)
 
+********************************
+Build123d - CadQuery Integration
+********************************
+
+As both `CadQuery <https://cadquery.readthedocs.io/en/latest/index.html>`_ and **build123d** use
+a common OpenCascade Python wrapper (`OCP <https://github.com/CadQuery/OCP>`_) it's possible to
+interchange objects between the two systems by transferring the ``wrapped`` objects as follows:
+
+.. code-block:: python
+
+    import build123d as b3d
+    b3d_solid = b3d.Solid.make_box(1,1,1)
+
+    ... some cadquery stuff ...
+
+    b3d_solid.wrapped = cq_solid.wrapped
+
+
+*****************
+Self Intersection
+*****************
+
+Avoid creating objects that intersect themselves - even if at a single vertex - as these topoplogies 
+will almost certainly be invalid (even if :meth:`~topology.Shape.is_valid` reports a ``True`` value).
+An example of where this my arise is with the thread of a screw (or any helical shape) where after
+one complete revolution the part may contact itself. One is likely be more successful if the part
+is split into multiple sections - say 180° of a helix - which are then stored in an assembly.

@@ -32,10 +32,10 @@ from math import copysign, cos, radians, sin, sqrt
 from typing import Iterable, Union
 
 from build123d.build_common import WorkplaneList, validate_inputs
-from build123d.build_enums import AngularDirection, LengthMode, Mode
+from build123d.build_enums import AngularDirection, GeomType, LengthMode, Mode
 from build123d.build_line import BuildLine
 from build123d.geometry import Axis, Plane, Vector, VectorLike
-from build123d.topology import Edge, Wire, Curve
+from build123d.topology import Edge, Face, Wire, Curve
 
 
 class BaseLineObject(Wire):
@@ -340,10 +340,107 @@ class Helix(BaseLineObject):
         validate_inputs(context, self)
 
         center_pnt = WorkplaneList.localize(center)
-        helix = Wire.make_helix(
+        helix = Edge.make_helix(
             pitch, height, radius, center_pnt, direction, cone_angle, lefthand
         )
         super().__init__(helix, mode=mode)
+
+
+class FilletPolyline(BaseLineObject):
+    """Line Object: FilletPolyline
+
+    Add a sequence of straight lines defined by successive points that
+    are filleted to a given radius.
+
+    Args:
+        pts (VectorLike): sequence of three or more points
+        radius (float): radius of filleted corners
+        close (bool, optional): close by generating an extra Edge. Defaults to False.
+        mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Raises:
+        ValueError: Three or more points not provided
+        ValueError: radius must be positive
+    """
+
+    _applies_to = [BuildLine._tag]
+
+    def __init__(
+        self,
+        *pts: VectorLike,
+        radius: float,
+        close: bool = False,
+        mode: Mode = Mode.ADD,
+    ):
+        context: BuildLine = BuildLine._get_context(self)
+        validate_inputs(context, self)
+
+        if len(pts) < 3:
+            raise ValueError("filletpolyline requires three or more pts")
+        if radius <= 0:
+            raise ValueError("radius must be positive")
+
+        lines_pts = WorkplaneList.localize(*pts)
+
+        # Create the polyline
+        new_edges = [
+            Edge.make_line(lines_pts[i], lines_pts[i + 1])
+            for i in range(len(lines_pts) - 1)
+        ]
+        if close and (new_edges[0] @ 0 - new_edges[-1] @ 1).length > 1e-5:
+            new_edges.append(Edge.make_line(new_edges[-1] @ 1, new_edges[0] @ 0))
+        wire_of_lines = Wire.make_wire(new_edges)
+
+        # Create a list of vertices from wire_of_lines in the same order as
+        # the original points so the resulting fillet edges are ordered
+        ordered_vertices = []
+        for pnts in lines_pts:
+            distance = {
+                v: (Vector(pnts) - Vector(*v)).length for v in wire_of_lines.vertices()
+            }
+            ordered_vertices.append(sorted(distance.items(), key=lambda x: x[1])[0][0])
+
+        # Fillet the corners
+
+        # Create a map of vertices to edges containing that vertex
+        vertex_to_edges = {
+            v: [e for e in wire_of_lines.edges() if v in e.vertices()]
+            for v in ordered_vertices
+        }
+
+        # For each corner vertex create a new fillet Edge
+        fillets = []
+        for vertex, edges in vertex_to_edges.items():
+            if len(edges) != 2:
+                continue
+            other_vertices = set(
+                ve for e in edges for ve in e.vertices() if ve != vertex
+            )
+            third_edge = Edge.make_line(*[v.to_tuple() for v in other_vertices])
+            fillet_face = Face.make_from_wires(
+                Wire.make_wire(edges + [third_edge])
+            ).fillet_2d(radius, [vertex])
+            fillets.append(fillet_face.edges().filter_by(GeomType.CIRCLE)[0])
+
+        # Create the Edges that join the fillets
+        if close:
+            interior_edges = [
+                Edge.make_line(fillets[i - 1] @ 1, fillets[i] @ 0)
+                for i in range(len(fillets))
+            ]
+            end_edges = []
+        else:
+            interior_edges = [
+                Edge.make_line(fillets[i] @ 1, f @ 0) for i, f in enumerate(fillets[1:])
+            ]
+            end_edges = [
+                Edge.make_line(wire_of_lines @ 0, fillets[0] @ 0),
+                Edge.make_line(fillets[-1] @ 1, wire_of_lines @ 1),
+            ]
+
+        new_wire = Wire.make_wire(end_edges + interior_edges + fillets)
+
+        super().__init__(new_wire, mode=mode)
 
 
 class JernArc(BaseLineObject):
@@ -357,6 +454,11 @@ class JernArc(BaseLineObject):
         radius (float): arc radius
         arc_size (float): arc size in degrees (negative to change direction)
         mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Attributes:
+        start (Vector): start point
+        end_of_arc (Vector): end point of arc
+        center_point (Vector): center of arc
     """
 
     _applies_to = [BuildLine._tag]
@@ -428,57 +530,6 @@ class Line(BaseLineObject):
         super().__init__(new_edge, mode=mode)
 
 
-# class IntersectingLine(BaseLineObject):
-#     """Intersecting Line Object: Line
-
-#     Add a straight line that intersects another line at a given parameter and angle.
-
-#     Args:
-#         at (float): u position on Edge between 0.0 and 1.0
-#         angle (float): angle in degrees
-#         length (float):
-#         reference (Union[Edge, Wire], optional): reference line. Defaults to None.
-#         mode (Mode, optional): combination mode. Defaults to Mode.ADD.
-
-#     Raises:
-#         ValueError: Multiple wires in context - provide a single wire
-#         ValueError: A reference Edge or Wire must be provided
-#     """
-
-#     _applies_to = [BuildLine._tag]
-
-#     def __init__(
-#         self,
-#         at: float,
-#         angle: float,
-#         length: float,
-#         reference: Union[Edge, Wire] = None,
-#         mode: Mode = Mode.ADD,
-#     ):
-#         context: BuildLine = BuildLine._get_context(self)
-#         validate_inputs(context, self)
-
-#         if reference is None:
-#             if context is not None:
-#                 wires = context.line.wires()
-#                 if len(wires) != 1:
-#                     raise ValueError(
-#                         f"Current BuildLine context contains none or multiple wires, "
-#                         f"a reference Edge or Wire must be provided"
-#                     )
-#                 reference = context.line.wires()[0]
-#             else:
-#                 raise ValueError("A reference Edge or Wire must be provided")
-
-#         intersection_pnt = reference.position_at(at)
-#         intersection_dir = reference.tangent_at(at).rotate(Axis.Z, angle)
-
-#         new_edge = Edge.make_line(
-#             intersection_pnt, intersection_pnt + intersection_dir * length
-#         )
-#         super().__init__(new_edge, mode=mode)
-
-
 class IntersectingLine(BaseLineObject):
     """Intersecting Line Object: Line
 
@@ -505,17 +556,11 @@ class IntersectingLine(BaseLineObject):
         validate_inputs(context, self)
 
         start = WorkplaneList.localize(start)
-        direction = WorkplaneList.localize(direction)
+        direction = WorkplaneList.localize(direction).normalized()
         axis = Axis(start, direction)
-        if context is None:
-            polar_workplane = Plane.XY
-        else:
-            polar_workplane = copy.copy(WorkplaneList._get_context().workplanes[0])
 
         intersection_pnts = [
-            i
-            for edge in other.edges()
-            for i in edge.intersections(polar_workplane, axis)
+            i for edge in other.edges() for i in edge.intersections(axis)
         ]
         if not intersection_pnts:
             raise ValueError("No intersections found")

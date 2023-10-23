@@ -32,6 +32,7 @@ Align
 right or left of each Axis. The following diagram shows how this alignment works in 2D:
 
 .. image:: assets/align.svg
+    :align: center
 
 For example:
 
@@ -95,6 +96,13 @@ The following objects all can be used in BuildLine contexts. Note that
 
         +++
         Elliptical arc defined by center,  radii & angles
+
+    .. grid-item-card:: :class:`~objects_curve.FilletPolyline`
+
+        .. image:: assets/filletpolyline_example.svg
+
+        +++
+        Polyline with filleted corners defined by pts and radius
 
     .. grid-item-card:: :class:`~objects_curve.Helix`
 
@@ -175,6 +183,7 @@ Reference
 .. autoclass:: Bezier
 .. autoclass:: CenterArc
 .. autoclass:: EllipticalCenterArc
+.. autoclass:: FilletPolyline
 .. autoclass:: Helix
 .. autoclass:: JernArc
 .. autoclass:: Line
@@ -191,12 +200,34 @@ Reference
 
 .. grid:: 3
 
+    .. grid-item-card:: :class:`~drafting.Arrow`
+
+        .. image:: assets/arrow.svg
+
+        +++
+        Arrow with head and path for shaft
+
+    .. grid-item-card:: :class:`~drafting.ArrowHead`
+
+        .. image:: assets/arrow_head.svg
+
+        +++
+        Arrow head with multiple types
+
+
     .. grid-item-card:: :class:`~objects_sketch.Circle`
 
         .. image:: assets/circle_example.svg
 
         +++
         Circle defined by radius
+
+    .. grid-item-card:: :class:`~drafting.DimensionLine`
+
+        .. image:: assets/d_line.svg
+
+        +++
+        Dimension line
 
 
     .. grid-item-card:: :class:`~objects_sketch.Ellipse`
@@ -205,6 +236,13 @@ Reference
 
         +++
         Ellipse defined by major and minor radius
+
+    .. grid-item-card:: :class:`~drafting.ExtensionLine`
+
+        .. image:: assets/e_line.svg
+
+        +++
+        Extension lines for distance or angles
 
     .. grid-item-card:: :class:`~objects_sketch.Polygon`
 
@@ -262,6 +300,13 @@ Reference
         +++
         SlotOverall defined by end-to-end length and height
 
+    .. grid-item-card:: :class:`~drafting.TechnicalDrawing`
+
+        .. image:: assets/tech_drawing.svg
+
+        +++
+        A technical drawing with descriptions
+
     .. grid-item-card:: :class:`~objects_sketch.Text`
 
         .. image:: assets/text_example.svg
@@ -283,8 +328,12 @@ Reference
 .. py:module:: objects_sketch
 
 .. autoclass:: BaseSketchObject
+.. autoclass:: drafting.Arrow
+.. autoclass:: drafting.ArrowHead
 .. autoclass:: Circle
+.. autoclass:: drafting.DimensionLine
 .. autoclass:: Ellipse
+.. autoclass:: drafting.ExtensionLine
 .. autoclass:: Polygon
 .. autoclass:: Rectangle
 .. autoclass:: RectangleRounded
@@ -293,6 +342,7 @@ Reference
 .. autoclass:: SlotCenterPoint
 .. autoclass:: SlotCenterToCenter
 .. autoclass:: SlotOverall
+.. autoclass:: drafting.TechnicalDrawing
 .. autoclass:: Text
 .. autoclass:: Trapezoid
 

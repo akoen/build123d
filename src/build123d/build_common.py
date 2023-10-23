@@ -44,10 +44,11 @@ import contextvars
 import inspect
 import logging
 import sys
+import warnings
 from abc import ABC, abstractmethod
 from itertools import product
 from math import sqrt
-from typing import Callable, Iterable, Union
+from typing import Callable, Iterable, Optional, Union
 from typing_extensions import Self
 
 from build123d.build_enums import Align, Mode, Select
@@ -85,6 +86,8 @@ logger = logging.getLogger("build123d")
 #
 # CONSTANTS
 #
+
+# LENGTH CONSTANTS
 MM = 1
 CM = 10 * MM
 M = 1000 * MM
@@ -92,14 +95,19 @@ IN = 25.4 * MM
 FT = 12 * IN
 THOU = IN / 1000
 
+# MASS CONSTANTS
+G = 1
+KG = 1000 * G
+LB = 453.59237 * G
 
 operations_apply_to = {
     "add": ["BuildPart", "BuildSketch", "BuildLine"],
     "bounding_box": ["BuildPart", "BuildSketch", "BuildLine"],
-    "chamfer": ["BuildPart", "BuildSketch"],
+    "chamfer": ["BuildPart", "BuildSketch", "BuildLine"],
     "extrude": ["BuildPart"],
-    "fillet": ["BuildPart", "BuildSketch"],
+    "fillet": ["BuildPart", "BuildSketch", "BuildLine"],
     "loft": ["BuildPart"],
+    "make_brake_formed": ["BuildPart"],
     "make_face": ["BuildSketch"],
     "make_hull": ["BuildSketch"],
     "mirror": ["BuildPart", "BuildSketch", "BuildLine"],
@@ -110,7 +118,8 @@ operations_apply_to = {
     "scale": ["BuildPart", "BuildSketch", "BuildLine"],
     "section": ["BuildPart"],
     "split": ["BuildPart", "BuildSketch", "BuildLine"],
-    "sweep": ["BuildPart"],
+    "sweep": ["BuildPart", "BuildSketch"],
+    "thicken": ["BuildPart"],
 }
 
 
@@ -122,6 +131,12 @@ class Builder(ABC):
     Args:
         workplanes: sequence of Union[Face, Plane, Location]: set plane(s) to work on
         mode (Mode, optional): combination mode. Defaults to Mode.ADD.
+
+    Attributes:
+        mode (Mode): builder's combination mode
+        workplanes (list[Plane]): active workplanes
+        builder_parent (Builder): build to pass objects to on exit
+
     """
 
     # Context variable used to by Objects and Operations to link to current builder instance
@@ -131,6 +146,7 @@ class Builder(ABC):
 
     # Abstract class variables
     _tag = "Builder"
+    _obj_name = "None"
     _shape = None
     _sub_class = None
 
@@ -146,8 +162,10 @@ class Builder(ABC):
         return self._obj.bounding_box().diagonal if self._obj else 0.0
 
     @property
-    def new_edges(self) -> ShapeList(Edge):
-        return new_edges(*([self.obj_before] + self.to_combine), combined=self._obj)
+    def new_edges(self) -> ShapeList[Edge]:
+        """Edges that changed during last operation"""
+        before_list = [] if self.obj_before is None else [self.obj_before]
+        return new_edges(*(before_list + self.to_combine), combined=self._obj)
 
     def __init__(
         self,
@@ -155,15 +173,18 @@ class Builder(ABC):
         mode: Mode = Mode.ADD,
     ):
         self.mode = mode
-        self.workplanes = workplanes
+        self.workplanes = WorkplaneList._convert_to_planes(workplanes)
         self._reset_tok = None
-        self._python_frame = inspect.currentframe().f_back.f_back
+        current_frame = inspect.currentframe()
+        assert current_frame is not None
+        assert current_frame.f_back is not None
+        self._python_frame = current_frame.f_back.f_back
         self.builder_parent = None
         self.lasts: dict = {Vertex: [], Edge: [], Face: [], Solid: []}
         self.workplanes_context = None
         self.exit_workplanes = None
-        self.obj_before: Shape = None
-        self.to_combine: list[Shape] = None
+        self.obj_before: Optional[Shape] = None
+        self.to_combine: list[Shape] = []
 
     def __enter__(self):
         """Upon entering record the parent and a token to restore contextvars"""
@@ -201,15 +222,20 @@ class Builder(ABC):
 
         return self
 
+    def _exit_extras(self):
+        """Any builder specific exit actions"""
+
     def __exit__(self, exception_type, exception_value, traceback):
         """Upon exiting restore context and send object to parent"""
         self._current.reset(self._reset_tok)
+
+        self._exit_extras()  # custom builder exit code
 
         if self.builder_parent is not None and self.mode != Mode.PRIVATE:
             logger.debug(
                 "Transferring object(s) to %s", type(self.builder_parent).__name__
             )
-            if self._obj is None:
+            if self._obj is None and not sys.exc_info()[1]:
                 raise RuntimeError(
                     f"{self._obj_name} is None - {self._tag} didn't create anything"
                 )
@@ -311,14 +337,12 @@ class Builder(ABC):
                         except:
                             plane = Plane(origin=(0, 0, 0), z_dir=face.normal_at())
 
-                        reoriented_face = plane.to_local_coords(face)
-                        aligned.append(
-                            reoriented_face.moved(
-                                Location((0, 0, -reoriented_face.center().Z))
-                            )
-                        )
-                    else:
+                        face = plane.to_local_coords(face)
+                        face.move(Location((0, 0, -face.center().Z)))
+                    if face.normal_at().Z > 0:  # Flip the face if up-side-down
                         aligned.append(face)
+                    else:
+                        aligned.append(-face)
                 typed[Face] = aligned
 
             # Convert wires to edges
@@ -419,7 +443,7 @@ class Builder(ABC):
             select (Select, optional): Vertex selector. Defaults to Select.ALL.
 
         Returns:
-            VertexList[Vertex]: Vertices extracted
+            ShapeList[Vertex]: Vertices extracted
         """
         vertex_list: list[Vertex] = []
         if select == Select.ALL:
@@ -434,6 +458,23 @@ class Builder(ABC):
                 f"Invalid input, must be one of Select.{Select._member_names_}"
             )
         return ShapeList(set(vertex_list))
+
+    def vertex(self, select: Select = Select.ALL) -> Vertex:
+        """Return Vertex
+
+        Return a vertex.
+
+        Args:
+            select (Select, optional): Vertex selector. Defaults to Select.ALL.
+
+        Returns:
+            Vertex: Vertex extracted
+        """
+        vertices = self.vertices(select)
+        vertex_count = len(vertices)
+        if vertex_count != 1:
+            warnings.warn(f"Found {vertex_count} vertices, returning first")
+        return vertices[0]
 
     def edges(self, select: Select = Select.ALL) -> ShapeList[Edge]:
         """Return Edges
@@ -458,6 +499,23 @@ class Builder(ABC):
             )
         return ShapeList(edge_list)
 
+    def edge(self, select: Select = Select.ALL) -> Edge:
+        """Return Edge
+
+        Return an edge.
+
+        Args:
+            select (Select, optional): Edge selector. Defaults to Select.ALL.
+
+        Returns:
+            Edge: Edge extracted
+        """
+        edges = self.edges(select)
+        edge_count = len(edges)
+        if edge_count != 1:
+            warnings.warn(f"Found {edge_count} edges, returning first")
+        return edges[0]
+
     def wires(self, select: Select = Select.ALL) -> ShapeList[Wire]:
         """Return Wires
 
@@ -480,6 +538,23 @@ class Builder(ABC):
                 f"Invalid input, must be one of Select.{Select._member_names_}"
             )
         return ShapeList(wire_list)
+
+    def wire(self, select: Select = Select.ALL) -> Wire:
+        """Return Wire
+
+        Return a wire.
+
+        Args:
+            select (Select, optional): Wire selector. Defaults to Select.ALL.
+
+        Returns:
+            Wire: Wire extracted
+        """
+        wires = self.wires(select)
+        wire_count = len(wires)
+        if wire_count != 1:
+            warnings.warn(f"Found {wire_count} wires, returning first")
+        return wires[0]
 
     def faces(self, select: Select = Select.ALL) -> ShapeList[Face]:
         """Return Faces
@@ -504,6 +579,24 @@ class Builder(ABC):
             )
         return ShapeList(face_list)
 
+    def face(self, select: Select = Select.ALL) -> Face:
+        """Return Face
+
+        Return a face.
+
+        Args:
+            select (Select, optional): Face selector. Defaults to Select.ALL.
+
+        Returns:
+            Face: Face extracted
+        """
+        faces = self.faces(select)
+        face_count = len(faces)
+        if face_count != 1:
+            msg = f"Found {face_count} faces, returning first"
+            warnings.warn(msg)
+        return faces[0]
+
     def solids(self, select: Select = Select.ALL) -> ShapeList[Solid]:
         """Return Solids
 
@@ -526,6 +619,23 @@ class Builder(ABC):
                 f"Invalid input, must be one of Select.{Select._member_names_}"
             )
         return ShapeList(solid_list)
+
+    def solid(self, select: Select = Select.ALL) -> Solid:
+        """Return Solid
+
+        Return a solid.
+
+        Args:
+            select (Select, optional): Solid selector. Defaults to Select.ALL.
+
+        Returns:
+            Solid: Solid extracted
+        """
+        solids = self.solids(select)
+        solid_count = len(solids)
+        if solid_count != 1:
+            warnings.warn(f"Found {solid_count} solids, returning first")
+        return solids[0]
 
     def _shapes(self, obj_type: Union[Vertex, Edge, Face, Solid] = None) -> ShapeList:
         """Extract Shapes"""
@@ -561,7 +671,7 @@ class Builder(ABC):
                 f"{validating_class.__class__.__name__} object or operation "
                 f"({validating_class.__class__.__name__} applies to {validating_class._applies_to})"
             )
-        elif (
+        if (
             isinstance(validating_class, str)
             and self.__class__.__name__ not in operations_apply_to[validating_class]
         ):
@@ -577,11 +687,6 @@ class Builder(ABC):
             )
             if obj is None:
                 pass
-            elif isinstance(obj, Builder):
-                raise RuntimeError(
-                    f"{operation} doesn't accept Builders as input,"
-                    f" did you intend <{obj.__class__.__name__}>.{obj._obj_name}?"
-                )
             elif not isinstance(obj, Shape):
                 raise RuntimeError(
                     f"{operation} doesn't accept {type(obj).__name__},"
@@ -623,7 +728,7 @@ class LocationList:
         context = WorkplaneList._get_context()
         workplanes = context.workplanes if context else [Plane.XY]
         global_locations = [
-            plane.to_location() * local_location
+            plane.location * local_location
             for plane in workplanes
             for local_location in self.local_locations
         ]
@@ -689,11 +794,19 @@ class HexLocations(LocationList):
     plus one half the spacing between the circles.
 
     Args:
-        apothem: radius of the inscribed circle
-        xCount: number of points ( > 0 )
-        yCount: number of points ( > 0 )
+        apothem (float): radius of the inscribed circle
+        xCount (int): number of points ( > 0 )
+        yCount (int): number of points ( > 0 )
         align (Union[Align, tuple[Align, Align]], optional): align min, center, or max of object.
             Defaults to (Align.CENTER, Align.CENTER).
+
+    Atributes:
+        apothem (float): radius of the inscribed circle
+        xCount (int): number of points ( > 0 )
+        yCount (int): number of points ( > 0 )
+        align (Union[Align, tuple[Align, Align]]): align min, center, or max of object.
+        diagonal (float): major radius
+        local_locations (list{Location}): locations relative to workplane
 
     Raises:
         ValueError: Spacing and count must be > 0
@@ -742,11 +855,11 @@ class HexLocations(LocationList):
         # Calculate the amount to offset the array to align it
         align_offset = []
         for i in range(2):
-            if align[i] == Align.MIN:
+            if self.align[i] == Align.MIN:
                 align_offset.append(0)
-            elif align[i] == Align.CENTER:
+            elif self.align[i] == Align.CENTER:
                 align_offset.append(-size[i] / 2)
-            elif align[i] == Align.MAX:
+            elif self.align[i] == Align.MAX:
                 align_offset.append(-size[i])
 
         # Align the points
@@ -773,6 +886,9 @@ class PolarLocations(LocationList):
         start_angle (float, optional): angle to first point from +ve X axis. Defaults to 0.0.
         angular_range (float, optional): magnitude of array from start angle. Defaults to 360.0.
         rotate (bool, optional): Align locations with arc tangents. Defaults to True.
+
+    Atributes:
+        local_locations (list{Location}): locations relative to workplane
 
     Raises:
         ValueError: Count must be greater than or equal to 1
@@ -814,6 +930,10 @@ class Locations(LocationList):
 
     Args:
         pts (Union[VectorLike, Vertex, Location]): sequence of points to push
+
+    Atributes:
+        local_locations (list{Location}): locations relative to workplane
+
     """
 
     def __init__(self, *pts: Union[VectorLike, Vertex, Location, Face, Plane, Axis]):
@@ -830,7 +950,7 @@ class Locations(LocationList):
             elif isinstance(point, Plane):
                 local_locations.append(Location(point))
             elif isinstance(point, Axis):
-                local_locations.append(point.to_location())
+                local_locations.append(point.location)
             elif isinstance(point, Face):
                 local_locations.append(Location(Plane(point)))
             else:
@@ -882,6 +1002,15 @@ class GridLocations(LocationList):
         align (Union[Align, tuple[Align, Align]], optional): align min, center, or max of object.
             Defaults to (Align.CENTER, Align.CENTER).
 
+
+    Attributes:
+        x_spacing (float): horizontal spacing
+        y_spacing (float): vertical spacing
+        x_count (int): number of horizontal points
+        y_count (int): number of vertical points
+        align (Union[Align, tuple[Align, Align]]): align min, center, or max of object.
+        local_locations (list{Location}): locations relative to workplane
+
     Raises:
         ValueError: Either x or y count must be greater than or equal to one.
     """
@@ -905,14 +1034,19 @@ class GridLocations(LocationList):
         self.align = tuplify(align, 2)
 
         size = [x_spacing * (x_count - 1), y_spacing * (y_count - 1)]
+        self.size = Vector(*size)  #: size of the grid
+
         align_offset = []
         for i in range(2):
-            if align[i] == Align.MIN:
+            if self.align[i] == Align.MIN:
                 align_offset.append(0.0)
-            elif align[i] == Align.CENTER:
+            elif self.align[i] == Align.CENTER:
                 align_offset.append(-size[i] / 2)
-            elif align[i] == Align.MAX:
+            elif self.align[i] == Align.MAX:
                 align_offset.append(-size[i])
+
+        self.min = Vector(*align_offset)  #: bottom left corner
+        self.max = self.min + self.size  #: top right corner
 
         # Create the list of local locations
         local_locations = []
@@ -940,6 +1074,9 @@ class WorkplaneList:
     Args:
         workplanes (sequence of Union[Face, Plane, Location]): objects to become planes
 
+    Attributes:
+        workplanes (list[Plane]): list of workplanes
+
     """
 
     # Context variable used to link to WorkplaneList instance
@@ -949,16 +1086,22 @@ class WorkplaneList:
 
     def __init__(self, *workplanes: Union[Face, Plane, Location]):
         self._reset_tok = None
-        self.workplanes = []
-        for plane in workplanes:
-            if isinstance(plane, Plane):
-                self.workplanes.append(plane)
-            elif isinstance(plane, (Location, Face)):
-                self.workplanes.append(Plane(plane))
-            else:
-                raise ValueError(f"WorkplaneList does not accept {type(plane)}")
+        self.workplanes = WorkplaneList._convert_to_planes(workplanes)
         self.locations_context = None
         self.plane_index = 0
+
+    @staticmethod
+    def _convert_to_planes(objs: Iterable[Union[Face, Plane, Location]]) -> list[Plane]:
+        """Translate objects to planes"""
+        planes = []
+        for obj in objs:
+            if isinstance(obj, Plane):
+                planes.append(obj)
+            elif isinstance(obj, (Location, Face)):
+                planes.append(Plane(obj))
+            else:
+                raise ValueError(f"WorkplaneList does not accept {type(obj)}")
+        return planes
 
     def __enter__(self):
         """Upon entering create a token to restore contextvars"""
@@ -1036,7 +1179,9 @@ def _vector_add_sub_wrapper(original_op: Callable[[Vector, VectorLike], Vector])
     def wrapper(self: Vector, vec: VectorLike):
         if isinstance(vec, tuple):
             try:
-                vec = WorkplaneList.localize(vec)  # type: ignore[union-attr]
+                # Relative adds must take into consideration planes with non-zero origins
+                origin = WorkplaneList._get_context().workplanes[0].origin
+                vec = WorkplaneList.localize(vec) - origin  # type: ignore[union-attr]
             except AttributeError:
                 # raised from `WorkplaneList._get_context().workplanes[0]` when context is `None`
                 # TODO make a specific `NoContextError` and raise that from `_get_context()` ?
@@ -1047,5 +1192,5 @@ def _vector_add_sub_wrapper(original_op: Callable[[Vector, VectorLike], Vector])
 
 
 logger.debug("monkey-patching `Vector.add` and `Vector.sub`")
-Vector.add = _vector_add_sub_wrapper(Vector.add)
-Vector.sub = _vector_add_sub_wrapper(Vector.sub)
+Vector.add = _vector_add_sub_wrapper(Vector.add)  # type: ignore
+Vector.sub = _vector_add_sub_wrapper(Vector.sub)  # type: ignore
